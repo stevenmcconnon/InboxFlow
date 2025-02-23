@@ -2,8 +2,8 @@
 # File: inboxflow-infrastructure/main.tf
 ############################################
 
-# --- VPC resource for production ---
 resource "aws_vpc" "main" {
+  count                = var.local_dev ? 0 : 1
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -17,13 +17,13 @@ provider "aws" {
   region     = var.aws_region
   access_key = var.aws_access_key
   secret_key = var.aws_secret_key
-  # Removed custom endpoints to use actual AWS endpoints.
+  skip_credentials_validation = var.local_dev
+  skip_metadata_api_check     = var.local_dev
+  skip_requesting_account_id  = var.local_dev
 }
 
-# ---------------------------------------------------------------------
-# S3 Bucket for Frontend Hosting (exposed to Internet)
-# ---------------------------------------------------------------------
 resource "aws_s3_bucket" "frontend" {
+  count  = var.local_dev ? 0 : 1
   bucket = "inboxflowfrontenddev"
   acl    = "public-read"
 
@@ -35,48 +35,37 @@ resource "aws_s3_bucket" "frontend" {
   }
 }
 
-# ---------------------------------------------------------------------
-# API Gateway for internal communication (if needed)
-# ---------------------------------------------------------------------
 resource "aws_api_gateway_rest_api" "api" {
+  count       = var.local_dev ? 0 : 1
   name        = "InboxFlowAPI"
   description = "API for InboxFlow backend services."
 }
 
-# ---------------------------------------------------------------------
-# SNS Topic
-# ---------------------------------------------------------------------
 resource "aws_sns_topic" "inboxflow_sns" {
-  name = "InboxFlow-SNS"
+  count = var.local_dev ? 0 : 1
+  name  = "InboxFlow-SNS"
 }
 
-# ---------------------------------------------------------------------
-# SQS Queue
-# ---------------------------------------------------------------------
 resource "aws_sqs_queue" "inboxflow_sqs" {
+  count                     = var.local_dev ? 0 : 1
   name                      = "InboxFlow-SQS"
   message_retention_seconds = 86400
 }
 
-# ---------------------------------------------------------------------
-# Aurora Serverless (PostgreSQL)
-# ---------------------------------------------------------------------
 resource "aws_rds_cluster" "aurora" {
-  count               = var.deploy_rds ? 1 : 0
-  cluster_identifier  = "inboxflow-db-cluster"
-  engine              = "aurora-postgresql"
-  engine_mode         = "serverless"
-  database_name       = "inboxflow"
-  master_username     = var.db_username
-  master_password     = var.db_password
+  count              = (var.deploy_rds && !var.local_dev) ? 1 : 0
+  cluster_identifier = "inboxflow-db-cluster"
+  engine             = "aurora-postgresql"
+  engine_mode        = "serverless"
+  database_name      = "inboxflow"
+  master_username    = var.db_username
+  master_password    = var.db_password
   skip_final_snapshot = true
 }
 
-# ---------------------------------------------------------------------
-# IAM Role for Lambda Function
-# ---------------------------------------------------------------------
 resource "aws_iam_role" "imap_sync_lambda_role" {
-  name = "imap_sync_lambda_role"
+  count = var.local_dev ? 0 : 1
+  name  = "imap_sync_lambda_role"
   assume_role_policy = jsonencode({
     Version   = "2012-10-17",
     Statement = [{
@@ -88,29 +77,31 @@ resource "aws_iam_role" "imap_sync_lambda_role" {
 }
 
 resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
-  role       = aws_iam_role.imap_sync_lambda_role.name
+  count      = var.local_dev ? 0 : 1
+  role       = aws_iam_role.imap_sync_lambda_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
-  role       = aws_iam_role.imap_sync_lambda_role.name
+  count      = var.local_dev ? 0 : 1
+  role       = aws_iam_role.imap_sync_lambda_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
 resource "aws_iam_role_policy_attachment" "secretsmanager_access" {
-  role       = aws_iam_role.imap_sync_lambda_role.name
+  count      = var.local_dev ? 0 : 1
+  role       = aws_iam_role.imap_sync_lambda_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
 }
 
-# ---------------------------------------------------------------------
-# Secrets Manager: Store sensitive values (DB_URL, EMAIL_SERVER, etc.)
-# ---------------------------------------------------------------------
 resource "aws_secretsmanager_secret" "imap_sync_secrets" {
-  name = "imap_sync_secrets"
+  count = var.local_dev ? 0 : 1
+  name  = "imap_sync_secrets"
 }
 
 resource "aws_secretsmanager_secret_version" "imap_sync_secrets_version" {
-  secret_id     = aws_secretsmanager_secret.imap_sync_secrets.id
+  count         = var.local_dev ? 0 : 1
+  secret_id     = aws_secretsmanager_secret.imap_sync_secrets[0].id
   secret_string = jsonencode({
     DB_URL         = var.db_url,
     EMAIL_SERVER   = var.email_server,
@@ -119,13 +110,11 @@ resource "aws_secretsmanager_secret_version" "imap_sync_secrets_version" {
   })
 }
 
-# ---------------------------------------------------------------------
-# Security Group for Lambda: Allow all outbound traffic
-# ---------------------------------------------------------------------
 resource "aws_security_group" "lambda_sg" {
+  count       = var.local_dev ? 0 : 1
   name        = "inboxflow-lambda-sg"
   description = "Security group for the Lambda function, allowing all outbound traffic"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = aws_vpc.main[0].id
 
   egress {
     from_port   = 0
@@ -135,80 +124,74 @@ resource "aws_security_group" "lambda_sg" {
   }
 }
 
-# ---------------------------------------------------------------------
-# Additional Resources for Internet Access
-# ---------------------------------------------------------------------
-
-# Internet Gateway
 resource "aws_internet_gateway" "main_igw" {
-  vpc_id = aws_vpc.main.id
+  count  = var.local_dev ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
 }
 
-# Public Subnet (for NAT Gateway)
 resource "aws_subnet" "public_subnet_1" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "us-west-1a"
+  count               = var.local_dev ? 0 : 1
+  vpc_id              = aws_vpc.main[0].id
+  cidr_block          = "10.0.1.0/24"
+  availability_zone   = "us-east-1a"
   map_public_ip_on_launch = true
 }
 
-# Public Route Table
 resource "aws_route_table" "public_rt" {
-  vpc_id = aws_vpc.main.id
+  count  = var.local_dev ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
 
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main_igw.id
+    gateway_id = aws_internet_gateway.main_igw[0].id
   }
 }
 
-# Associate Public Route Table with Public Subnet
 resource "aws_route_table_association" "public_subnet_assoc" {
-  subnet_id      = aws_subnet.public_subnet_1.id
-  route_table_id = aws_route_table.public_rt.id
+  count          = var.local_dev ? 0 : 1
+  subnet_id      = aws_subnet.public_subnet_1[0].id
+  route_table_id = aws_route_table.public_rt[0].id
 }
 
-# Elastic IP for NAT Gateway
 resource "aws_eip" "nat_eip" {
-  vpc = true
+  count = var.local_dev ? 0 : 1
+  vpc   = true
 }
 
-# NAT Gateway
 resource "aws_nat_gateway" "main_nat_gw" {
-  allocation_id = aws_eip.nat_eip.id
-  subnet_id     = aws_subnet.public_subnet_1.id
+  count         = var.local_dev ? 0 : 1
+  allocation_id = aws_eip.nat_eip[0].id
+  subnet_id     = aws_subnet.public_subnet_1[0].id
 }
 
-# Private Subnet (for Lambda, etc.)
 resource "aws_subnet" "private_subnet_1" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.2.0/24"
-  availability_zone       = "us-west-1a"
+  count               = var.local_dev ? 0 : 1
+  vpc_id              = aws_vpc.main[0].id
+  cidr_block          = "10.0.2.0/24"
+  availability_zone   = "us-east-1a"
   map_public_ip_on_launch = false
 }
 
-# Private Route Table (routes 0.0.0.0/0 to NAT Gateway)
 resource "aws_route_table" "private_rt" {
-  vpc_id = aws_vpc.main.id
+  count  = var.local_dev ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
 
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main_nat_gw.id
+    nat_gateway_id = aws_nat_gateway.main_nat_gw[0].id
   }
 }
 
-# Associate Private Route Table with Private Subnet
 resource "aws_route_table_association" "private_subnet_assoc" {
-  subnet_id      = aws_subnet.private_subnet_1.id
-  route_table_id = aws_route_table.private_rt.id
+  count          = var.local_dev ? 0 : 1
+  subnet_id      = aws_subnet.private_subnet_1[0].id
+  route_table_id = aws_route_table.private_rt[0].id
 }
 
-# ---------------------------------------------------------------------
-# Lambda Function for IMAP Sync
-# ---------------------------------------------------------------------
 resource "aws_lambda_function" "imap_sync_lambda" {
+  count = var.local_dev ? 0 : 1
   function_name = "inboxflow-imap-sync"
-  role          = aws_iam_role.imap_sync_lambda_role.arn
+  role          = aws_iam_role.imap_sync_lambda_role[0].arn
   handler       = "imap_sync.lambda_handler"
   runtime       = "python3.9"
   timeout       = var.lambda_timeout
@@ -228,6 +211,6 @@ resource "aws_lambda_function" "imap_sync_lambda" {
 
   vpc_config {
     subnet_ids         = var.lambda_subnet_ids
-    security_group_ids = [aws_security_group.lambda_sg.id]
+    security_group_ids = [aws_security_group.lambda_sg[0].id]
   }
 }
