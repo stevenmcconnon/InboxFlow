@@ -25,7 +25,6 @@ variable "db_username" {
 variable "db_password" {
   description = "Database admin password"
   type        = string
-  sensitive   = false
   default     = "pass"
 }
 
@@ -36,21 +35,21 @@ variable "db_url" {
 }
 
 variable "email_server" {
-  description = "IMAP email server (e.g., imap.mail.yahoo.com)"
+  description = "IMAP email server"
   type        = string
-  default     = "imap.testserver.com"
+  default     = "imap.mail.yahoo.com"
 }
 
 variable "email_user" {
   description = "Email user for IMAP login"
   type        = string
-  default     = "testuser"
+  default     = "you@example.com"
 }
 
 variable "email_password" {
   description = "Email password for IMAP login"
   type        = string
-  default     = "testpassword"
+  default     = "REDACTED_APP_PASSWORD"
 }
 
 variable "lambda_zip_path" {
@@ -69,23 +68,23 @@ variable "batch_size" {
   default     = 1000
 }
 
-# LocalStack endpoint variables for testing
+# LocalStack endpoint variables are no longer used; leave them blank.
 variable "lambda_endpoint" {
-  description = "Custom endpoint for Lambda (for local testing with LocalStack)"
+  description = "Custom endpoint for Lambda (not used with SAM CLI)"
   default     = ""
 }
 
 variable "s3_endpoint" {
-  description = "Custom endpoint for S3 (for local testing with LocalStack)"
+  description = "Custom endpoint for S3 (not used with SAM CLI)"
   default     = ""
 }
 
 variable "apigateway_endpoint" {
-  description = "Custom endpoint for API Gateway (for local testing with LocalStack)"
+  description = "Custom endpoint for API Gateway (not used with SAM CLI)"
   default     = ""
 }
 
-# VPC configuration for Lambda (if required)
+# VPC configuration for Lambda (if required in production)
 variable "lambda_subnet_ids" {
   description = "List of subnet IDs for the Lambda function"
   type        = list(string)
@@ -98,17 +97,17 @@ variable "lambda_security_group_ids" {
   default     = []
 }
 
-# ECS Variables for deploying additional Dockerized services
+# ECS Variables for deploying additional Dockerized services (production)
 variable "ecs_subnet_ids" {
   description = "List of subnet IDs for ECS services"
   type        = list(string)
-  default     = []  # Set your local or production subnet IDs here
+  default     = []  
 }
 
 variable "ecs_security_group_ids" {
   description = "List of security group IDs for ECS services"
   type        = list(string)
-  default     = []  # Set your local or production security group IDs here
+  default     = []
 }
 
 variable "deploy_ecs" {
@@ -117,17 +116,14 @@ variable "deploy_ecs" {
   default     = false
 }
 
-# New variable: whether to deploy RDS resources
 variable "deploy_rds" {
   description = "Deploy RDS resources? Set to true for production, false for local testing."
   type        = bool
   default     = false
 }
 
-# New variable to control S3 website configuration for local testing
 variable "use_website_configuration" {
   description = "Enable website configuration for S3 bucket. Set to true for production, false for local testing."
   type        = bool
   default     = false
 }
-

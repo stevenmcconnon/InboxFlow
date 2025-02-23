@@ -2,10 +2,10 @@ SHELL := /bin/bash
 
 .PHONY: all build-all run-all test-all clean \
         build-dispatcher build-imap-sync build-api build-frontend build-db build-flows \
-        run-dispatcher run-imap-sync run-api run-frontend run-db run-flows run-db\
+        run-dispatcher run-imap-sync run-api run-frontend run-db run-flows \
         test-dispatcher test-imap-sync test-api test-frontend test-flows \
         stop-all stop-dispatcher stop-imap-sync stop-api stop-frontend stop-flows \
-        deploy-lambda package-lambda localstack-up deploy-prod local-env prod-env 
+        deploy-lambda package-lambda local-env prod-env sam-build sam-local
 
 # Target to automatically load local environment variables from .env
 local-env:
@@ -148,16 +148,11 @@ deploy-lambda: local-env package-lambda
 	@echo "Deploying Lambda function and infrastructure via Terraform (local)..."
 	cd inboxflow-infrastructure && terraform init && terraform apply -auto-approve
 
-# Start LocalStack with the local .env file
-localstack-up:
-	@echo "Starting LocalStack with Docker socket mounted..."
-	docker run --rm -it -p 4566:4566 -p 4571:4571 \
-	  -v /var/run/docker.sock:/var/run/docker.sock \
-	  --env LAMBDA_EXECUTOR=docker \
-	  --env-file .env \
-	  localstack/localstack
+# SAM CLI Targets for Local Development
+sam-build:
+	@echo "Building Lambda with SAM CLI..."
+	sam build
 
-# Deploy production infrastructure using production environment (loads .env.prod)
-deploy-prod: prod-env
-	@echo "Deploying production infrastructure..."
-	cd inboxflow-infrastructure && terraform init && terraform apply -var-file="terraform.prod.tfvars" -auto-approve
+sam-local:
+	@echo "Starting SAM local API..."
+	sam local start-api

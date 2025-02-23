@@ -2,45 +2,28 @@
 # File: inboxflow-infrastructure/main.tf
 ############################################
 
-# --- Add a VPC resource for LocalStack ---
+# --- VPC resource for production ---
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = {
-    Name = "localstack-vpc"
+    Name = "production-vpc"
   }
 }
 
 provider "aws" {
-  region                      = var.aws_region
-  access_key                  = var.aws_access_key
-  secret_key                  = var.aws_secret_key
-  skip_credentials_validation = true
-  skip_metadata_api_check     = true
-  skip_requesting_account_id  = true
-
-  endpoints {
-    lambda         = var.lambda_endpoint != "" ? var.lambda_endpoint : "http://127.0.0.1:4566"
-    s3             = var.s3_endpoint != "" ? var.s3_endpoint : "http://127.0.0.1:4566"
-    apigateway     = var.apigateway_endpoint != "" ? var.apigateway_endpoint : "http://127.0.0.1:4566"
-    sns            = "http://127.0.0.1:4566"
-    sqs            = "http://127.0.0.1:4566"
-    rds            = "http://127.0.0.1:4566"
-    iam            = "http://127.0.0.1:4566"
-    secretsmanager = "http://127.0.0.1:4566"
-    ec2            = "http://127.0.0.1:4566"  # Ensure EC2 calls go to LocalStack
-  }
+  region     = var.aws_region
+  access_key = var.aws_access_key
+  secret_key = var.aws_secret_key
+  # Removed custom endpoints to use actual AWS endpoints.
 }
-
-# Note: Ensure that your .env file sets AWS_S3_FORCE_PATH_STYLE=true for LocalStack testing.
 
 # ---------------------------------------------------------------------
 # S3 Bucket for Frontend Hosting (exposed to Internet)
 # ---------------------------------------------------------------------
 resource "aws_s3_bucket" "frontend" {
-  # Use a bucket name without hyphens to avoid DNS resolution issues with LocalStack.
   bucket = "inboxflowfrontenddev"
   acl    = "public-read"
 
@@ -104,7 +87,6 @@ resource "aws_iam_role" "imap_sync_lambda_role" {
   })
 }
 
-# IAM Policy Attachments for Lambda: Basic execution, VPC access, Secrets Manager access, etc.
 resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
   role       = aws_iam_role.imap_sync_lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -145,7 +127,6 @@ resource "aws_security_group" "lambda_sg" {
   description = "Security group for the Lambda function, allowing all outbound traffic"
   vpc_id      = aws_vpc.main.id
 
-  # Outbound rule: allow all traffic
   egress {
     from_port   = 0
     to_port     = 0
@@ -158,20 +139,20 @@ resource "aws_security_group" "lambda_sg" {
 # Additional Resources for Internet Access
 # ---------------------------------------------------------------------
 
-# 1) Internet Gateway
+# Internet Gateway
 resource "aws_internet_gateway" "main_igw" {
   vpc_id = aws_vpc.main.id
 }
 
-# 2) Public Subnet (for NAT Gateway)
+# Public Subnet (for NAT Gateway)
 resource "aws_subnet" "public_subnet_1" {
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"      # <-- Adjust as needed
-  availability_zone       = "us-east-1a"       # <-- Adjust as needed
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-west-1a"
   map_public_ip_on_launch = true
 }
 
-# 3) Public Route Table
+# Public Route Table
 resource "aws_route_table" "public_rt" {
   vpc_id = aws_vpc.main.id
 
@@ -181,32 +162,32 @@ resource "aws_route_table" "public_rt" {
   }
 }
 
-# 4) Associate Public Route Table with Public Subnet
+# Associate Public Route Table with Public Subnet
 resource "aws_route_table_association" "public_subnet_assoc" {
   subnet_id      = aws_subnet.public_subnet_1.id
   route_table_id = aws_route_table.public_rt.id
 }
 
-# 5) Elastic IP for NAT Gateway
+# Elastic IP for NAT Gateway
 resource "aws_eip" "nat_eip" {
   vpc = true
 }
 
-# 6) NAT Gateway
+# NAT Gateway
 resource "aws_nat_gateway" "main_nat_gw" {
   allocation_id = aws_eip.nat_eip.id
   subnet_id     = aws_subnet.public_subnet_1.id
 }
 
-# 7) Private Subnet (where Lambda runs, routes to NAT)
+# Private Subnet (for Lambda, etc.)
 resource "aws_subnet" "private_subnet_1" {
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.2.0/24"      # <-- Adjust as needed
-  availability_zone       = "us-east-1a"       # <-- Adjust as needed
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "us-west-1a"
   map_public_ip_on_launch = false
 }
 
-# 8) Private Route Table (routes 0.0.0.0/0 to NAT Gateway)
+# Private Route Table (routes 0.0.0.0/0 to NAT Gateway)
 resource "aws_route_table" "private_rt" {
   vpc_id = aws_vpc.main.id
 
@@ -216,7 +197,7 @@ resource "aws_route_table" "private_rt" {
   }
 }
 
-# 9) Associate Private Route Table with Private Subnet
+# Associate Private Route Table with Private Subnet
 resource "aws_route_table_association" "private_subnet_assoc" {
   subnet_id      = aws_subnet.private_subnet_1.id
   route_table_id = aws_route_table.private_rt.id
@@ -245,7 +226,6 @@ resource "aws_lambda_function" "imap_sync_lambda" {
     }
   }
 
-  # Updated VPC config: use the dedicated security group and the private subnet
   vpc_config {
     subnet_ids         = var.lambda_subnet_ids
     security_group_ids = [aws_security_group.lambda_sg.id]
