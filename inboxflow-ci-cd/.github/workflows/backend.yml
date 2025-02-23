@@ -1,0 +1,41 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest tests/
+
+      - name: Build Docker image
+        run: |
+          docker build -t inboxflow-backend .
+
+      - name: Push Docker image to ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          echo "Logging into AWS ECR"
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+          docker tag inboxflow-backend:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/inboxflow-backend:latest
+          docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/inboxflow-backend:latest

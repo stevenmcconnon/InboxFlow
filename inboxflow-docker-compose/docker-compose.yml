@@ -1,0 +1,26 @@
+version: "3.8"
+services:
+  postgres:
+    image: postgres:13
+    container_name: inboxflow-postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: inboxflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../inboxflow-db/migration.sql:/docker-entrypoint-initdb.d/migration.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      inboxflow-network:
+        aliases:
+          - inboxflow-postgres
+
+volumes:
+  postgres-data:
+
+networks:
+  inboxflow-network:
+    name: inboxflow-network
+    driver: bridge

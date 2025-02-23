@@ -1,0 +1,4 @@
+imapclient
+psycopg2-binary==2.9.6
+python-dotenv
+boto3

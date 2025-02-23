@@ -1,0 +1,32 @@
+# Global ignores
+.DS_Store
+.env
+*.log
+*.pyc
+__pycache__/
+node_modules/
+build/
+dist/
+
+# Ignore all local Python virtual environments
+venv/
+*.venv/
+
+# Ignore Terraform state files (infrastructure)
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Ignore Docker-related files
+docker-compose.override.yml
+*.tar
+*.container
+
+# Ignore IDE-specific settings
+.vscode/
+.idea/
+*.iml
+
+# Ignore system files (Mac & Linux)
+Thumbs.db
+*.swp

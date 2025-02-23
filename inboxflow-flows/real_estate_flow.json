@@ -1,0 +1,17 @@
+{
+  "name": "Real Estate Lead Flow",
+  "conditions": {
+    "subject_contains": ["property", "investment", "real estate"],
+    "sender_contains": ["@realestate.com", "@investors.com"]
+  },
+  "actions": [
+    {
+      "step": 1,
+      "if": "AI_confirms_real_estate_lead",
+      "then": {
+        "generate_response": "Ask about the property details and price range."
+      }
+    }
+  ],
+  "approval_required": true
+}

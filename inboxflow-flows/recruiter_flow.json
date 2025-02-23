@@ -1,0 +1,31 @@
+{
+  "name": "Recruiter Email Flow",
+  "conditions": {
+    "subject_contains": ["recruiter", "job opportunity", "hiring"],
+    "sender_contains": ["@hiring.com", "@recruiters.com"]
+  },
+  "actions": [
+    {
+      "step": 1,
+      "if": "AI_confirms_recruiter_email",
+      "then": {
+        "generate_response": "Ask if the job is remote and how much it pays."
+      }
+    },
+    {
+      "step": 2,
+      "if": "response_received",
+      "then": {
+        "evaluate": "If pay is greater than $85/hr and remote, accept."
+      }
+    },
+    {
+      "step": 3,
+      "if": "pay_is_below_85",
+      "then": {
+        "generate_response": "Negotiate for $80/hr minimum."
+      }
+    }
+  ],
+  "approval_required": true
+}
