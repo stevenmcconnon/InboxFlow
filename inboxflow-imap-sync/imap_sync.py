@@ -104,18 +104,19 @@ async def search_emails(client, last_sync):
         if last_sync:
             date_str = last_sync.strftime("%d-%b-%Y")
             logger.info(f"Searching emails SINCE {date_str}")
-            resp = await client.send(f"SEARCH SINCE {date_str}")
+            # Use the built-in search() method
+            resp = await client.search(f"SINCE {date_str}")
         else:
             logger.info("Searching for ALL emails")
-            resp = await client.send("SEARCH ALL")
+            resp = await client.search("ALL")
         if resp.result != "OK":
-            logger.error("Error searching emails.")
+            logger.error("Error searching emails. Response: %s", resp)
             return []
         uids_line = b" ".join(resp.lines).decode()
-        # This returns message sequence numbers, not UIDs.
-        uids = uids_line.split()
-        logger.info(f"Found {len(uids)} message sequence numbers using search criteria.")
-        return uids
+        # This returns message sequence numbers
+        msg_nums = uids_line.split()
+        logger.info(f"Found {len(msg_nums)} message sequence numbers using search criteria.")
+        return msg_nums
     except Exception as e:
         logger.error(f"Exception during email search: {e}")
         return []
@@ -232,20 +233,44 @@ async def process_folder(folder, db_pool):
     logger.info(f"Starting processing for folder '{folder}'")
     client = await connect_imap()
     try:
+        # Attempt to select the folder
         await client.select(f'"{folder}"')
     except Exception as e:
         logger.error(f"Error selecting folder '{folder}': {e}")
         await client.logout()
         return
+
+    # Retrieve last_sync from DB
     last_sync = await get_folder_last_sync(db_pool, folder)
+    # Search for emails (could fail or return 0 messages if the server rejects the command)
     uids = await search_emails(client, last_sync)
+
+    # If we got nothing, skip updating last_sync
+    if not uids:
+        logger.warning(
+            f"No messages found or search failed for folder '{folder}'. "
+            f"Not updating last_sync."
+        )
+        await client.logout()
+        return
+
+    # We have some message sequence numbers—proceed with normal sync
     logger.info(f"Folder '{folder}': {len(uids)} message sequence numbers found.")
     await client.logout()
-    batches = [uids[i:i+BATCH_SIZE] for i in range(0, len(uids), BATCH_SIZE)]
+
+    # Batch the UIDs for concurrent processing
+    batches = [uids[i : i + BATCH_SIZE] for i in range(0, len(uids), BATCH_SIZE)]
     logger.info(f"Folder '{folder}': Divided into {len(batches)} batches.")
+
+    # Process each batch concurrently
     await asyncio.gather(*(process_batch(batch, folder, db_pool) for batch in batches))
+
+    # Update the folder's last_sync marker only if we actually fetched messages
     await update_folder_last_sync(db_pool, folder, datetime.utcnow())
+
+    # Cleanup any emails in DB that are no longer present on the server
     await cleanup_deleted_emails(folder, uids, db_pool)
+
     logger.info(f"Completed processing for folder '{folder}'")
 
 ####################################
