@@ -97,29 +97,43 @@ async def get_folders():
         
 
 ####################################
-# Search Emails using raw SEARCH command (non-UID)
+# Search Emails
 ####################################
 async def search_emails(client, last_sync):
     try:
-        if last_sync:
-            date_str = last_sync.strftime("%d-%b-%Y")
-            logger.info(f"Searching emails SINCE {date_str}")
-            # Use the built-in search() method
-            resp = await client.search(f"SINCE {date_str}")
-        else:
-            logger.info("Searching for ALL emails")
-            resp = await client.search("ALL")
+        logger.info("Fetching last 100 email UIDs using FETCH instead of SEARCH")
+
+        # Get all UIDs with FETCH
+        resp = await client.uid("FETCH", "1:*", "(UID)")
         if resp.result != "OK":
-            logger.error("Error searching emails. Response: %s", resp)
+            logger.error(f"Error fetching UIDs. Response: {resp}")
             return []
-        uids_line = b" ".join(resp.lines).decode()
-        # This returns message sequence numbers
-        msg_nums = uids_line.split()
-        logger.info(f"Found {len(msg_nums)} message sequence numbers using search criteria.")
-        return msg_nums
+
+        # Extract UIDs
+        uids = []
+        for line in resp.lines:
+            try:
+                decoded_line = line.decode(errors="ignore")
+                match = re.search(r"UID (\d+)", decoded_line)
+                if match:
+                    uids.append(match.group(1))
+            except Exception as e:
+                logger.error(f"Error parsing UID line: {e}")
+
+        if not uids:
+            logger.warning("No UIDs found. Mailbox may be empty.")
+            return []
+
+        # Get only the last 100 messages
+        last_100_msgs = uids[-100:] if len(uids) > 100 else uids
+        logger.info(f"Fetched {len(last_100_msgs)} UIDs (most recent emails).")
+        return last_100_msgs
+
     except Exception as e:
-        logger.error(f"Exception during email search: {e}")
+        logger.error(f"Exception during email fetch: {e}")
         return []
+
+    
 
 ####################################
 # Batch fetching of headers (combined fetch for a list of message sequence numbers)
