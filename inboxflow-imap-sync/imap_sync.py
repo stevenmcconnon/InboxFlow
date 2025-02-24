@@ -41,6 +41,7 @@ async def get_folder_last_sync(db_pool, folder):
         logger.info(f"Folder '{folder}': last sync marker = {last_sync}")
         return last_sync
 
+
 async def update_folder_last_sync(db_pool, folder, timestamp):
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -51,7 +52,8 @@ async def update_folder_last_sync(db_pool, folder, timestamp):
             """,
             folder, timestamp
         )
-    logger.info(f"Updated last sync marker for folder '{folder}' to {timestamp}")
+    logger.info(f"✅ Updated last sync marker for folder '{folder}' to {timestamp}")
+
 
 ####################################
 # IMAP Connection
@@ -100,71 +102,226 @@ async def get_folders():
 # Search Emails
 ####################################
 async def search_emails(client, last_sync):
+    """
+    Fetches all UIDs in this folder and returns the last 100 (sorted ascending).
+    Uses resp.lines instead of resp.data.
+    """
     try:
         logger.info("Fetching last 100 email UIDs using FETCH instead of SEARCH")
 
-        # Get all UIDs with FETCH
+        # Example command: UID FETCH 1:* (UID)
         resp = await client.uid("FETCH", "1:*", "(UID)")
         if resp.result != "OK":
             logger.error(f"Error fetching UIDs. Response: {resp}")
             return []
 
-        # Extract UIDs
+        # In older aioimaplib, the server's raw reply is in resp.lines
         uids = []
-        for line in resp.lines:
-            try:
-                decoded_line = line.decode(errors="ignore")
-                match = re.search(r"UID (\d+)", decoded_line)
-                if match:
-                    uids.append(match.group(1))
-            except Exception as e:
-                logger.error(f"Error parsing UID line: {e}")
+        for raw_line in resp.lines:
+            line = raw_line.decode(errors="ignore")
+            # Typically looks like: '* 37 FETCH (UID 19 FLAGS (\Seen))'
+            uid_match = re.search(r"UID (\d+)", line)
+            if uid_match:
+                uids.append(uid_match.group(1))
 
         if not uids:
             logger.warning("No UIDs found. Mailbox may be empty.")
             return []
 
-        # Get only the last 100 messages
-        last_100_msgs = uids[-100:] if len(uids) > 100 else uids
-        logger.info(f"Fetched {len(last_100_msgs)} UIDs (most recent emails).")
-        return last_100_msgs
+        # Sort numerically, then keep only the last 100
+        uids = sorted(uids, key=lambda x: int(x))
+        last_100 = uids[-100:] if len(uids) > 100 else uids
+        logger.info(f"Fetched {len(last_100)} UIDs (most recent emails).")
+
+        return last_100
 
     except Exception as e:
         logger.error(f"Exception during email fetch: {e}")
         return []
 
-    
-
 ####################################
 # Batch fetching of headers (combined fetch for a list of message sequence numbers)
 ####################################
 async def fetch_headers_batch(client, uid_batch):
+    """
+    Fetch email headers using multiple approaches (RFC822.HEADER, BODY[HEADER], or BODY[]).
+    Logs every line to debug why headers might be missing.
+    """
     try:
         uid_list = ",".join(uid_batch)
         logger.info(f"Fetching headers for batch: {uid_list}")
-        # Use UID FETCH even if search was non-UID; many servers allow UID FETCH if message sequence numbers are used.
-        command = f"UID FETCH {uid_list} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE)])"
-        resp = await client.send(command)
+
+        # First, try fetching just the headers (this should work, but Yahoo may return NIL)
+        resp = await client.uid("FETCH", uid_list, "(UID FLAGS RFC822.HEADER)")
+
+        # Debug: Log everything the server sends back
+        logger.debug(f"--- FETCH response result: {resp.result}")
+        for i, raw_line in enumerate(resp.lines):
+            logger.debug(f"FETCH line {i}: {raw_line.decode(errors='ignore')}")
+
         if resp.result != "OK":
-            logger.error(f"Error fetching headers for batch: {uid_list}")
+            logger.error(f"Error fetching headers for batch {uid_list}: {resp}")
             return {}
-        headers = {}
-        for line in resp.lines:
-            try:
-                decoded_line = line.decode(errors="ignore")
-                if "FETCH" in decoded_line:
-                    parts = decoded_line.split(" ")
-                    if len(parts) > 1 and parts[1].isdigit():
-                        uid = parts[1]
-                        headers[uid] = decoded_line
-            except Exception as e:
-                logger.error(f"Error parsing header line: {e}")
-        logger.info(f"Batch {uid_list}: Fetched headers for UIDs: {list(headers.keys())}")
-        return headers
+
+        headers_map = {}
+        current_uid = None
+        buffer = []
+        reading_header = False
+
+        for raw_line in resp.lines:
+            line = raw_line.decode(errors="ignore")
+
+            # Debugging: Log raw line data
+            logger.debug(f"Parsing line: {line}")
+
+            # Start of a new FETCH response
+            if line.startswith("* "):
+                # Store previous UID's headers if any
+                if current_uid and buffer:
+                    headers_map[current_uid] = "\n".join(buffer)
+
+                current_uid = None
+                buffer.clear()
+                reading_header = False
+
+                # Extract UID from response line
+                uid_match = re.search(r"UID (\d+)", line)
+                if uid_match:
+                    current_uid = uid_match.group(1)
+
+                # Detect if headers will follow
+                if "RFC822.HEADER" in line and line.strip().endswith("}"):
+                    reading_header = True
+                elif "RFC822.HEADER NIL" in line:
+                    logger.warning(f"IMAP returned NIL for UID {current_uid}. Headers not available.")
+
+            # If we hit just a ")", this closes the FETCH block
+            elif line.strip() == ")":
+                if current_uid and buffer:
+                    headers_map[current_uid] = "\n".join(buffer)
+                current_uid = None
+                buffer.clear()
+                reading_header = False
+
+            # Otherwise, if we're in the header block, store the lines
+            elif reading_header and current_uid:
+                buffer.append(line)
+
+        # Final save for last UID
+        if current_uid and buffer:
+            headers_map[current_uid] = "\n".join(buffer)
+
+        logger.info(f"Fetched headers for UIDs: {list(headers_map.keys())}")
+
+        # If still no headers, try BODY[HEADER.FIELDS]
+        if not headers_map:
+            logger.warning("RFC822.HEADER returned no headers. Trying BODY[HEADER.FIELDS]...")
+
+            fields = "(DATE FROM TO CC SUBJECT CONTENT-TYPE)"
+            resp = await client.uid("FETCH", uid_list, f"(UID FLAGS BODY[HEADER.FIELDS {fields}])")
+
+            # Debug: Log raw response
+            logger.debug(f"--- FETCH BODY[HEADER.FIELDS] response result: {resp.result}")
+            for i, raw_line in enumerate(resp.lines):
+                logger.debug(f"FETCH line {i}: {raw_line.decode(errors='ignore')}")
+
+            if resp.result != "OK":
+                logger.error(f"Error fetching headers using BODY[HEADER.FIELDS]: {resp}")
+                return {}
+
+            headers_map = {}
+            current_uid = None
+            buffer = []
+            reading_header = False
+
+            for raw_line in resp.lines:
+                line = raw_line.decode(errors="ignore")
+                logger.debug(f"Parsing line: {line}")
+
+                if line.startswith("* "):
+                    if current_uid and buffer:
+                        headers_map[current_uid] = "\n".join(buffer)
+
+                    current_uid = None
+                    buffer.clear()
+                    reading_header = False
+
+                    uid_match = re.search(r"UID (\d+)", line)
+                    if uid_match:
+                        current_uid = uid_match.group(1)
+
+                    if "BODY[HEADER.FIELDS" in line and line.strip().endswith("}"):
+                        reading_header = True
+
+                elif line.strip() == ")":
+                    if current_uid and buffer:
+                        headers_map[current_uid] = "\n".join(buffer)
+                    current_uid = None
+                    buffer.clear()
+                    reading_header = False
+
+                elif reading_header and current_uid:
+                    buffer.append(line)
+
+            logger.info(f"Fetched headers from BODY[HEADER.FIELDS]: {list(headers_map.keys())}")
+
+        # If still no headers, last resort: Fetch full email headers using BODY[]
+        if not headers_map:
+            logger.warning("BODY[HEADER.FIELDS] also returned no headers. Trying BODY[] (full message)...")
+
+            resp = await client.uid("FETCH", uid_list, "(UID FLAGS BODY[])")
+
+            # Debug: Log raw response
+            logger.debug(f"--- FETCH BODY[] response result: {resp.result}")
+            for i, raw_line in enumerate(resp.lines):
+                logger.debug(f"FETCH line {i}: {raw_line.decode(errors='ignore')}")
+
+            if resp.result != "OK":
+                logger.error(f"Error fetching full message using BODY[]: {resp}")
+                return {}
+
+            headers_map = {}
+            current_uid = None
+            buffer = []
+            reading_header = False
+
+            for raw_line in resp.lines:
+                line = raw_line.decode(errors="ignore")
+                logger.debug(f"Parsing line: {line}")
+
+                if line.startswith("* "):
+                    if current_uid and buffer:
+                        headers_map[current_uid] = "\n".join(buffer)
+
+                    current_uid = None
+                    buffer.clear()
+                    reading_header = False
+
+                    uid_match = re.search(r"UID (\d+)", line)
+                    if uid_match:
+                        current_uid = uid_match.group(1)
+
+                    if "BODY[" in line and line.strip().endswith("}"):
+                        reading_header = True
+
+                elif line.strip() == ")":
+                    if current_uid and buffer:
+                        headers_map[current_uid] = "\n".join(buffer)
+                    current_uid = None
+                    buffer.clear()
+                    reading_header = False
+
+                elif reading_header and current_uid:
+                    buffer.append(line)
+
+            logger.info(f"Fetched headers from BODY[]: {list(headers_map.keys())}")
+
+        return headers_map
+
     except Exception as e:
         logger.error(f"Exception in fetch_headers_batch: {e}")
         return {}
-
+    
 ####################################
 # Parse header to extract metadata and attachment flag
 ####################################
@@ -186,9 +343,13 @@ def parse_header(header):
 # Store email header (upsert) into the database
 ####################################
 async def store_email_header(db_pool, uid, header, folder):
+    """
+    Parses and stores email headers in the database.
+    """
     try:
         subject, sender, has_attachment = parse_header(header)
         last_synced = datetime.utcnow()
+
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """
@@ -203,9 +364,12 @@ async def store_email_header(db_pool, uid, header, folder):
                 """,
                 uid, subject, sender, last_synced, folder, has_attachment, "pending"
             )
-        logger.info(f"Stored header for UID {uid} in folder '{folder}'")
+
+        logger.info(f"Stored email UID {uid} in folder '{folder}'")
+
     except Exception as e:
-        logger.error(f"Error storing header for UID {uid} in folder '{folder}': {e}")
+        logger.error(f"Error storing email UID {uid} in folder '{folder}': {e}")
+
 
 ####################################
 # Cleanup deleted emails for a folder
@@ -231,10 +395,20 @@ async def process_batch(uid_batch, folder, db_pool):
     client = await connect_imap()
     try:
         await client.select(f'"{folder}"')
-        headers = await fetch_headers_batch(client, uid_batch)
-        tasks = [store_email_header(db_pool, uid, header, folder) for uid, header in headers.items()]
-        if tasks:
-            await asyncio.gather(*tasks)
+
+        headers_map = await fetch_headers_batch(client, uid_batch)
+        if not headers_map:
+            logger.warning(
+                f"No headers found in batch for folder '{folder}', skipping DB insert."
+            )
+            return
+
+        # Now store them in the DB
+        tasks = []
+        for uid, header in headers_map.items():
+            tasks.append(store_email_header(db_pool, uid, header, folder))
+        await asyncio.gather(*tasks)
+
     except Exception as e:
         logger.error(f"Error processing batch in folder '{folder}': {e}")
     finally:
@@ -247,45 +421,37 @@ async def process_folder(folder, db_pool):
     logger.info(f"Starting processing for folder '{folder}'")
     client = await connect_imap()
     try:
-        # Attempt to select the folder
         await client.select(f'"{folder}"')
     except Exception as e:
         logger.error(f"Error selecting folder '{folder}': {e}")
         await client.logout()
         return
 
-    # Retrieve last_sync from DB
     last_sync = await get_folder_last_sync(db_pool, folder)
-    # Search for emails (could fail or return 0 messages if the server rejects the command)
     uids = await search_emails(client, last_sync)
 
-    # If we got nothing, skip updating last_sync
-    if not uids:
-        logger.warning(
-            f"No messages found or search failed for folder '{folder}'. "
-            f"Not updating last_sync."
-        )
-        await client.logout()
-        return
-
-    # We have some message sequence numbers—proceed with normal sync
-    logger.info(f"Folder '{folder}': {len(uids)} message sequence numbers found.")
     await client.logout()
 
-    # Batch the UIDs for concurrent processing
+    if not uids:
+        logger.warning(
+            f"No messages found in folder '{folder}', skipping last_sync update."
+        )
+        return
+
+    logger.info(f"Folder '{folder}': {len(uids)} message sequence numbers found.")
     batches = [uids[i : i + BATCH_SIZE] for i in range(0, len(uids), BATCH_SIZE)]
     logger.info(f"Folder '{folder}': Divided into {len(batches)} batches.")
 
-    # Process each batch concurrently
-    await asyncio.gather(*(process_batch(batch, folder, db_pool) for batch in batches))
+    await asyncio.gather(*(process_batch(b, folder, db_pool) for b in batches))
 
-    # Update the folder's last_sync marker only if we actually fetched messages
+    # Update last_sync
     await update_folder_last_sync(db_pool, folder, datetime.utcnow())
 
-    # Cleanup any emails in DB that are no longer present on the server
+    # Clean up emails that no longer exist on the server
     await cleanup_deleted_emails(folder, uids, db_pool)
-
     logger.info(f"Completed processing for folder '{folder}'")
+
+
 
 ####################################
 # Discover folders and process each sequentially (can later be parallelized)
