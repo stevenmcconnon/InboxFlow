@@ -2,7 +2,7 @@
 
 variable "aws_region" {
   description = "AWS region to deploy resources"
-  default     = "us-west-1"
+  default     = "us-east-1"
 }
 
 variable "aws_access_key" {
@@ -68,6 +68,13 @@ variable "batch_size" {
   default     = 1000
 }
 
+# New variable to control local development behavior
+variable "local_dev" {
+  description = "Set to true for local development (skips AWS resource creation and credential validation)"
+  type        = bool
+  default     = true
+}
+
 # LocalStack endpoint variables are no longer used; leave them blank.
 variable "lambda_endpoint" {
   description = "Custom endpoint for Lambda (not used with SAM CLI)"
@@ -101,7 +108,7 @@ variable "lambda_security_group_ids" {
 variable "ecs_subnet_ids" {
   description = "List of subnet IDs for ECS services"
   type        = list(string)
-  default     = []  
+  default     = []
 }
 
 variable "ecs_security_group_ids" {

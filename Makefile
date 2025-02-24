@@ -5,7 +5,8 @@ SHELL := /bin/bash
         run-dispatcher run-imap-sync run-api run-frontend run-db run-flows \
         test-dispatcher test-imap-sync test-api test-frontend test-flows \
         stop-all stop-dispatcher stop-imap-sync stop-api stop-frontend stop-flows \
-        deploy-lambda package-lambda local-env prod-env sam-build sam-local
+        deploy-lambda package-lambda local-env prod-env sam-build sam-local \
+        deploy-local deploy-prod
 
 # Target to automatically load local environment variables from .env
 local-env:
@@ -156,3 +157,16 @@ sam-build:
 sam-local:
 	@echo "Starting SAM local API..."
 	sam local start-api
+
+# Deploy local and production via Terraform workspaces
+deploy-local:
+	@echo "Deploying to local (using local-dev workspace)..."
+	cd inboxflow-infrastructure && \
+	terraform workspace select local-dev || terraform workspace new local-dev && \
+	terraform apply -var="local_dev=true" -auto-approve
+
+deploy-prod:
+	@echo "Deploying to AWS production (using default workspace)..."
+	cd inboxflow-infrastructure && \
+	terraform workspace select default || terraform workspace new default && \
+	terraform apply -var="local_dev=false" -var-file="terraform.prod.tfvars" -auto-approve

@@ -1,17 +1,24 @@
--- Create the emails table if it doesn't exist
+-- migration.sql
+
+-- Create the 'emails' table with the new schema for IMAP sync.
 CREATE TABLE IF NOT EXISTS emails (
-    id SERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     subject TEXT NOT NULL,
     sender TEXT NOT NULL,
-    received_at TIMESTAMP DEFAULT NOW(),
-    content TEXT,
+    last_synced TIMESTAMP DEFAULT NOW(),
+    folder TEXT NOT NULL,
+    has_attachment BOOLEAN DEFAULT FALSE,
     status TEXT DEFAULT 'pending'
 );
 
--- Now add the last_synced column if it's not already there
-ALTER TABLE emails ADD COLUMN IF NOT EXISTS last_synced TIMESTAMP DEFAULT NOW();
+-- Create the 'folder_sync' table to track per-folder last sync markers.
+CREATE TABLE IF NOT EXISTS folder_sync (
+    folder TEXT PRIMARY KEY,
+    last_sync TIMESTAMP DEFAULT NOW()
+);
 
--- Existing migrations for other tables
+-- Existing tables for other features of the app:
+
 CREATE TABLE IF NOT EXISTS email_flows (
     id SERIAL PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,
