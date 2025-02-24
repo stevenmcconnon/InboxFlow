@@ -1,34 +1,66 @@
+import os
 import asyncio
 import aioimaplib
 import asyncpg
 import logging
-import os
-import boto3
-import json
+import re
 from email.parser import BytesParser
+from datetime import datetime
+from dotenv import load_dotenv
+import sys
 
-# Configuration from environment or defaults
+# Load environment variables from .env
+load_dotenv()
+
+# Environment configuration
 EMAIL_SERVER = os.getenv("EMAIL_SERVER", "imap.mail.yahoo.com")
 EMAIL_USER = os.getenv("EMAIL_USER", "you@example.com")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "REDACTED_APP_PASSWORD")  # app password
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "REDACTED_APP_PASSWORD")
 DB_URL = os.getenv("DB_URL")
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
-LAMBDA_FUNCTION_NAME = os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))  # Configurable batch size
 
-# Configure logging
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# Configure logging: flush logs to STDOUT immediately
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.propagate = False
 
+logger.info("Environment loaded. (Sensitive values are not logged.)")
+
+####################################
+# Database helper functions for per-folder last sync
+####################################
+async def get_folder_last_sync(db_pool, folder):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT last_sync FROM folder_sync WHERE folder = $1", folder)
+        last_sync = row["last_sync"] if row else None
+        logger.info(f"Folder '{folder}': last sync marker = {last_sync}")
+        return last_sync
+
+async def update_folder_last_sync(db_pool, folder, timestamp):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO folder_sync (folder, last_sync)
+            VALUES ($1, $2)
+            ON CONFLICT (folder) DO UPDATE SET last_sync = EXCLUDED.last_sync
+            """,
+            folder, timestamp
+        )
+    logger.info(f"Updated last sync marker for folder '{folder}' to {timestamp}")
+
+####################################
+# IMAP Connection
+####################################
 async def connect_imap():
-    """
-    Establish and return an asynchronous IMAP connection using aioimaplib.
-    Retries on failure.
-    """
     try:
         client = aioimaplib.IMAP4_SSL(EMAIL_SERVER)
         await client.wait_hello_from_server()
         await client.login(EMAIL_USER, EMAIL_PASSWORD)
-        await client.select("INBOX")
         logger.info("Connected to IMAP server.")
         return client
     except Exception as e:
@@ -36,167 +68,231 @@ async def connect_imap():
         await asyncio.sleep(10)
         return await connect_imap()
 
-async def fetch_uids(client):
-    """
-    Fetch all message UIDs from the server.
-    """
-    resp = await client.uid("SEARCH", "ALL")
-    if resp.result != 'OK':
-        logger.error("Error fetching UIDs.")
+####################################
+# Dynamic Folder Discovery
+####################################
+async def get_folders():
+    client = await connect_imap()
+    try:
+        logger.info("Listing all folders using client.list('\"\"', '\"*\"')...")
+        resp = await client.list('""', '"*"')
+        folders = []
+        for line in resp.lines:
+            try:
+                decoded = line.decode(errors="ignore")
+                logger.debug(f"Raw folder line: {decoded}")
+                match = re.search(r' "([^"]+)"$', decoded)
+                if match:
+                    folder_name = match.group(1)
+                    folders.append(folder_name)
+            except Exception as ex:
+                logger.error(f"Error parsing folder line: {ex}")
+        logger.info(f"Discovered folders: {folders}")
+        return folders
+    except Exception as e:
+        logger.error(f"Error during folder discovery: {e}")
         return []
-    # Combine response lines and split into UIDs.
-    uids_line = b" ".join(resp.lines).decode()
-    uids = uids_line.split()
-    return uids
+    finally:
+        await client.logout()
+        
 
-async def bulk_fetch_headers(client, uid_list):
-    """
-    Fetch email headers in bulk (FROM, SUBJECT, DATE) for the given list of UIDs.
-    Here we concurrently pipeline header fetches.
-    """
-    headers = {}
-    async def fetch_header(uid):
-        resp = await client.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
-        if resp.result == 'OK' and resp.lines:
-            header = b" ".join(resp.lines).decode(errors="ignore")
-            headers[uid] = header
+####################################
+# Search Emails using raw SEARCH command (non-UID)
+####################################
+async def search_emails(client, last_sync):
+    try:
+        if last_sync:
+            date_str = last_sync.strftime("%d-%b-%Y")
+            logger.info(f"Searching emails SINCE {date_str}")
+            resp = await client.send(f"SEARCH SINCE {date_str}")
         else:
-            logger.error(f"Failed to fetch header for UID {uid}")
-    await asyncio.gather(*(fetch_header(uid) for uid in uid_list))
-    return headers
+            logger.info("Searching for ALL emails")
+            resp = await client.send("SEARCH ALL")
+        if resp.result != "OK":
+            logger.error("Error searching emails.")
+            return []
+        uids_line = b" ".join(resp.lines).decode()
+        # This returns message sequence numbers, not UIDs.
+        uids = uids_line.split()
+        logger.info(f"Found {len(uids)} message sequence numbers using search criteria.")
+        return uids
+    except Exception as e:
+        logger.error(f"Exception during email search: {e}")
+        return []
 
+####################################
+# Batch fetching of headers (combined fetch for a list of message sequence numbers)
+####################################
+async def fetch_headers_batch(client, uid_batch):
+    try:
+        uid_list = ",".join(uid_batch)
+        logger.info(f"Fetching headers for batch: {uid_list}")
+        # Use UID FETCH even if search was non-UID; many servers allow UID FETCH if message sequence numbers are used.
+        command = f"UID FETCH {uid_list} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE)])"
+        resp = await client.send(command)
+        if resp.result != "OK":
+            logger.error(f"Error fetching headers for batch: {uid_list}")
+            return {}
+        headers = {}
+        for line in resp.lines:
+            try:
+                decoded_line = line.decode(errors="ignore")
+                if "FETCH" in decoded_line:
+                    parts = decoded_line.split(" ")
+                    if len(parts) > 1 and parts[1].isdigit():
+                        uid = parts[1]
+                        headers[uid] = decoded_line
+            except Exception as e:
+                logger.error(f"Error parsing header line: {e}")
+        logger.info(f"Batch {uid_list}: Fetched headers for UIDs: {list(headers.keys())}")
+        return headers
+    except Exception as e:
+        logger.error(f"Exception in fetch_headers_batch: {e}")
+        return {}
+
+####################################
+# Parse header to extract metadata and attachment flag
+####################################
+def parse_header(header):
+    subject = "No Subject"
+    sender = "Unknown"
+    has_attachment = False
+    for line in header.splitlines():
+        if line.startswith("Subject:"):
+            subject = line[len("Subject:"):].strip()
+        elif line.startswith("From:"):
+            sender = line[len("From:"):].strip()
+        elif line.startswith("Content-Type:"):
+            if "multipart/mixed" in line.lower():
+                has_attachment = True
+    return subject, sender, has_attachment
+
+####################################
+# Store email header (upsert) into the database
+####################################
+async def store_email_header(db_pool, uid, header, folder):
+    try:
+        subject, sender, has_attachment = parse_header(header)
+        last_synced = datetime.utcnow()
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO emails (id, subject, sender, last_synced, folder, has_attachment, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (id) DO UPDATE 
+                    SET subject = EXCLUDED.subject,
+                        sender = EXCLUDED.sender,
+                        last_synced = EXCLUDED.last_synced,
+                        folder = EXCLUDED.folder,
+                        has_attachment = EXCLUDED.has_attachment
+                """,
+                uid, subject, sender, last_synced, folder, has_attachment, "pending"
+            )
+        logger.info(f"Stored header for UID {uid} in folder '{folder}'")
+    except Exception as e:
+        logger.error(f"Error storing header for UID {uid} in folder '{folder}': {e}")
+
+####################################
+# Cleanup deleted emails for a folder
+####################################
+async def cleanup_deleted_emails(folder, server_uids, db_pool):
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id FROM emails WHERE folder = $1", folder)
+            stored_uids = {row["id"] for row in rows}
+            current_uids = set(server_uids)
+            uids_to_delete = stored_uids - current_uids
+            for uid in uids_to_delete:
+                await conn.execute("DELETE FROM emails WHERE id = $1 AND folder = $2", uid, folder)
+                logger.info(f"Deleted UID {uid} from folder '{folder}' (no longer on server).")
+    except Exception as e:
+        logger.error(f"Error during cleanup in folder '{folder}': {e}")
+
+####################################
+# Process a batch: Each batch uses its own IMAP connection for concurrency.
+####################################
+async def process_batch(uid_batch, folder, db_pool):
+    logger.info(f"Processing batch in folder '{folder}': {uid_batch}")
+    client = await connect_imap()
+    try:
+        await client.select(f'"{folder}"')
+        headers = await fetch_headers_batch(client, uid_batch)
+        tasks = [store_email_header(db_pool, uid, header, folder) for uid, header in headers.items()]
+        if tasks:
+            await asyncio.gather(*tasks)
+    except Exception as e:
+        logger.error(f"Error processing batch in folder '{folder}': {e}")
+    finally:
+        await client.logout()
+
+####################################
+# Process a single folder: select folder, search emails, process batches concurrently, update folder marker.
+####################################
+async def process_folder(folder, db_pool):
+    logger.info(f"Starting processing for folder '{folder}'")
+    client = await connect_imap()
+    try:
+        await client.select(f'"{folder}"')
+    except Exception as e:
+        logger.error(f"Error selecting folder '{folder}': {e}")
+        await client.logout()
+        return
+    last_sync = await get_folder_last_sync(db_pool, folder)
+    uids = await search_emails(client, last_sync)
+    logger.info(f"Folder '{folder}': {len(uids)} message sequence numbers found.")
+    await client.logout()
+    batches = [uids[i:i+BATCH_SIZE] for i in range(0, len(uids), BATCH_SIZE)]
+    logger.info(f"Folder '{folder}': Divided into {len(batches)} batches.")
+    await asyncio.gather(*(process_batch(batch, folder, db_pool) for batch in batches))
+    await update_folder_last_sync(db_pool, folder, datetime.utcnow())
+    await cleanup_deleted_emails(folder, uids, db_pool)
+    logger.info(f"Completed processing for folder '{folder}'")
+
+####################################
+# Discover folders and process each sequentially (can later be parallelized)
+####################################
+async def process_all_folders(db_pool):
+    folders = await get_folders()
+    logger.info(f"Processing {len(folders)} folders.")
+    for folder in folders:
+        logger.info(f"Processing folder: {folder}")
+        await process_folder(folder, db_pool)
+
+####################################
+# Fetch full email (for lazy loading on demand)
+####################################
 async def fetch_full_email(client, uid):
-    """
-    Fetch the full email (RFC822) for a given UID.
-    """
-    resp = await client.uid("FETCH", uid, "(RFC822)")
-    if resp.result == 'OK' and resp.lines:
-        raw_email = b"".join(resp.lines)
-        return raw_email
-    else:
-        logger.error(f"Failed to fetch full email for UID {uid}")
+    try:
+        resp = await client.uid("FETCH", uid, "(RFC822)")
+        if resp.result == "OK" and resp.lines:
+            full_email = b"".join(resp.lines)
+            logger.info(f"Fetched full email for UID {uid}")
+            return full_email
+        else:
+            logger.error(f"Failed to fetch full email for UID {uid}")
+            return None
+    except Exception as e:
+        logger.error(f"Exception fetching full email for UID {uid}: {e}")
         return None
 
-async def fetch_and_process(client, uid, db_pool):
-    """
-    For a given UID, fetch the full email, parse it, and store it in the database.
-    """
-    raw_email = await fetch_full_email(client, uid)
-    if raw_email:
-        try:
-            msg = BytesParser().parsebytes(raw_email)
-            subject = msg.get("Subject", "No Subject")
-            sender = msg.get("From", "Unknown Sender")
-            content = raw_email.decode("utf-8", errors="ignore")
-        except Exception as e:
-            logger.error(f"Error parsing email {uid}: {e}")
-            subject = "Parsing Error"
-            sender = "Parsing Error"
-            content = raw_email.decode("utf-8", errors="ignore")
-        async with db_pool.acquire() as conn:
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO emails (id, subject, sender, content, status)
-                    VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (id) DO NOTHING
-                    """,
-                    uid, subject, sender, content, "pending"
-                )
-                logger.info(f"Email {uid} inserted into DB.")
-            except Exception as e:
-                logger.error(f"DB insertion error for email {uid}: {e}")
-
-async def process_batch(uid_batch, db_pool):
-    """
-    Process a batch of UIDs concurrently:
-      - Optionally fetch headers for preliminary filtering/display.
-      - Concurrently fetch full emails and store them.
-    """
-    client = await connect_imap()
-    if not client:
-        logger.error("IMAP client connection failed for batch processing.")
-        return
-
-    # Fetch headers concurrently (this can be used for lightweight processing if desired)
-    headers = await bulk_fetch_headers(client, uid_batch)
-    logger.info(f"Fetched headers for UIDs: {list(headers.keys())}")
-
-    # Concurrently fetch and process each email in the batch
-    await asyncio.gather(*(fetch_and_process(client, uid, db_pool) for uid in uid_batch))
-
-    await client.logout()
-
-async def cleanup_deleted_emails(all_server_uids, db_pool):
-    """
-    Remove emails from the database that are no longer present on the server.
-    """
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id FROM emails")
-        db_uids = {row["id"] for row in rows}
-        server_uids_set = set(all_server_uids)
-        uids_to_delete = db_uids - server_uids_set
-        for uid in uids_to_delete:
-            try:
-                await conn.execute("DELETE FROM emails WHERE id = $1", uid)
-                logger.info(f"Email {uid} deleted from DB (cleanup).")
-            except Exception as e:
-                logger.error(f"DB deletion error for email {uid}: {e}")
-
-async def invoke_lambda(next_index):
-    """
-    Asynchronously re-invoke the AWS Lambda function for the next batch.
-    """
-    lambda_client = boto3.client("lambda")
-    payload = {"start_index": next_index}
-    try:
-        response = lambda_client.invoke(
-            FunctionName=LAMBDA_FUNCTION_NAME,
-            InvocationType="Event",
-            Payload=json.dumps(payload)
-        )
-        logger.info(f"Lambda re-invoked for batch starting at index {next_index}: {response}")
-    except Exception as e:
-        logger.error(f"Failed to invoke Lambda for next batch: {e}")
-
+####################################
+# Main handler for Lambda
+####################################
 async def main_handler(event):
-    """
-    Main asynchronous handler:
-      - Connects to IMAP to retrieve all UIDs.
-      - Processes emails in batches using asynchronous techniques.
-      - Cleans up deleted emails.
-      - Re-invokes Lambda if additional batches remain.
-    """
-    start_index = int(event.get("start_index", 0))
-    logger.info(f"Lambda invoked with start_index: {start_index}")
-
-    # Initial connection to get all UIDs
-    client = await connect_imap()
-    uids = await fetch_uids(client)
-    total_msgs = len(uids)
-    logger.info(f"Total emails on server: {total_msgs}")
-    await client.logout()
-
-    # Set up asynchronous database connection pool
+    logger.info("IMAP sync process started - v1.0.0")
     db_pool = await asyncpg.create_pool(DB_URL)
     try:
-        for i in range(start_index, total_msgs, BATCH_SIZE):
-            uid_batch = uids[i:i+BATCH_SIZE]
-            await process_batch(uid_batch, db_pool)
-            # If there are more emails, re-invoke Lambda for the next batch
-            if i + BATCH_SIZE < total_msgs:
-                await invoke_lambda(i + BATCH_SIZE)
+        await process_all_folders(db_pool)
     finally:
-        await cleanup_deleted_emails(uids, db_pool)
         await db_pool.close()
-
-    return {"status": "completed", "processed": total_msgs, "total": total_msgs}
+    logger.info("IMAP sync process completed.")
+    return {"status": "completed"}
 
 def lambda_handler(event, context):
+    logger.info("Lambda invoked. Starting IMAP sync 0.1...")
     return asyncio.run(main_handler(event))
 
 if __name__ == "__main__":
-    # For local testing:
-    test_event = {"start_index": 0}
+    test_event = {}
     result = asyncio.run(main_handler(test_event))
     print(result)
