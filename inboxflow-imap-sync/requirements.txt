@@ -1,4 +1,3 @@
-aioimaplib
-asyncpg
-boto3
-dotenv
+imapclient==2.3.1
+asyncpg==0.29.0
+python-dotenv==1.0.1
