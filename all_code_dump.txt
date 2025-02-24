@@ -1,0 +1,4025 @@
+============================================
+File: ./Makefile
+Directory: .
+============================================
+SHELL := /bin/bash
+
+.PHONY: all build-all run-all test-all clean \
+        build-dispatcher build-imap-sync build-api build-frontend build-db build-flows \
+        run-dispatcher run-imap-sync run-api run-frontend run-db run-flows run-db\
+        test-dispatcher test-imap-sync test-api test-frontend test-flows \
+        stop-all stop-dispatcher stop-imap-sync stop-api stop-frontend stop-flows \
+        deploy-lambda package-lambda localstack-up deploy-prod local-env prod-env 
+
+# Target to automatically load local environment variables from .env
+local-env:
+	@echo "Loading local environment from .env..."
+	@set -a; source .env; set +a
+
+# Target to automatically load production environment variables from .env.prod
+prod-env:
+	@echo "Loading production environment from .env.prod..."
+	@set -a; source .env.prod; set +a
+
+# Build all services
+build-all: build-dispatcher build-imap-sync build-api build-frontend build-flows
+
+build-dispatcher:
+	@echo "Building Dispatcher Service..."
+	cd inboxflow_dispatcher && docker build -t inboxflow_dispatcher .
+
+build-imap-sync:
+	@echo "Building IMAP Sync Service..."
+	cd inboxflow-imap-sync && docker build -t inboxflow-imap-sync .
+
+build-api:
+	@echo "Building API Service..."
+	cd inboxflow-api && docker build -t inboxflow-api .
+
+build-frontend:
+	@echo "Building Frontend Service..."
+	cd inboxflow-frontend && docker build -t inboxflow-frontend .
+
+build-db:
+	@echo "Setting up database migrations..."
+	docker cp inboxflow-db/migration.sql inboxflow-postgres:/tmp/migration.sql
+	docker exec -it inboxflow-postgres psql -U user -d inboxflow -f /tmp/migration.sqlcf
+
+build-flows:
+	@echo "Building Flows Service..."
+	cd inboxflow-flows && docker build -t inboxflow-flows .
+
+# Run all services
+run-all: run-db run-dispatcher run-api run-frontend run-flows deploy-lambda
+
+run-db:
+	@echo "Starting Postgres database container..."
+	docker-compose -f inboxflow-docker-compose/docker-compose.yml up -d
+
+run-dispatcher:
+	@echo "Running Dispatcher Service..."
+	docker stop inboxflow_dispatcher || true
+	docker rm inboxflow_dispatcher || true
+	docker run -d --name inboxflow_dispatcher --network inboxflow-network \
+	  --env-file inboxflow_dispatcher/.env inboxflow_dispatcher
+
+run-imap-sync:
+	@echo "Running IMAP Sync Service as container (for local testing)..."
+	docker stop inboxflow-imap-sync || true
+	docker rm inboxflow-imap-sync || true
+	docker run -d --name inboxflow-imap-sync --network inboxflow-network \
+	  --env-file inboxflow-imap-sync/.env inboxflow-imap-sync
+
+run-api:
+	@echo "Running API Service on port 8000..."
+	docker stop inboxflow-api || true
+	docker rm inboxflow-api || true
+	docker run -d --name inboxflow-api --network inboxflow-network -p 8000:8000 \
+	  --env-file inboxflow-api/.env inboxflow-api
+
+run-frontend:
+	@echo "Running Frontend Service..."
+	docker stop inboxflow-frontend || true
+	docker rm inboxflow-frontend || true
+	docker run -d --name inboxflow-frontend --network inboxflow-network -p 3000:3000 inboxflow-frontend
+
+run-flows:
+	@echo "Running Flows Service..."
+	docker stop inboxflow-flows || true
+	docker rm inboxflow-flows || true
+	docker run -d --name inboxflow-flows --network inboxflow-network inboxflow-flows
+
+# Test all services
+test-all: test-dispatcher test-imap-sync test-api test-frontend test-flows
+
+test-dispatcher:
+	@echo "Testing Dispatcher Service..."
+	cd inboxflow_dispatcher && pytest tests/
+
+test-imap-sync:
+	@echo "Testing IMAP Sync Service..."
+	cd inboxflow-imap-sync && pytest tests/
+
+test-api:
+	@echo "Testing API Service..."
+	cd inboxflow-api && pytest tests/
+
+test-frontend:
+	@echo "Testing Frontend Service..."
+	cd inboxflow-frontend && npm test
+
+test-flows:
+	@echo "Testing Flows Service..."
+	cd inboxflow-flows && pytest tests/
+
+# Stop all services
+stop-all:
+	@echo "Stopping all running services..."
+	docker stop inboxflow_dispatcher inboxflow-imap-sync inboxflow-api inboxflow-frontend inboxflow-flows || true
+
+stop-dispatcher:
+	@echo "Stopping Dispatcher Service..."
+	docker stop inboxflow_dispatcher || true
+
+stop-imap-sync:
+	@echo "Stopping IMAP Sync Service..."
+	docker stop inboxflow-imap-sync || true
+
+stop-api:
+	@echo "Stopping API Service..."
+	docker stop inboxflow-api || true
+
+stop-frontend:
+	@echo "Stopping Frontend Service..."
+	docker stop inboxflow-frontend || true
+
+stop-flows:
+	@echo "Stopping Flows Service..."
+	docker stop inboxflow-flows || true
+
+# Clean up Docker resources
+clean:
+	@echo "Cleaning up Docker resources..."
+	docker system prune -f
+
+# Package the Lambda function into a zip file
+package-lambda:
+	@echo "Packaging Lambda function..."
+	./package_lambda.sh
+
+# Deploy Lambda using Terraform for local environment (uses .env)
+deploy-lambda: local-env package-lambda
+	@echo "Deploying Lambda function and infrastructure via Terraform (local)..."
+	cd inboxflow-infrastructure && terraform init && terraform apply -auto-approve
+
+# Start LocalStack with the local .env file
+localstack-up:
+	@echo "Starting LocalStack with Docker socket mounted..."
+	docker run --rm -it -p 4566:4566 -p 4571:4571 \
+	  -v /var/run/docker.sock:/var/run/docker.sock \
+	  --env LAMBDA_EXECUTOR=docker \
+	  --env-file .env \
+	  localstack/localstack
+
+# Deploy production infrastructure using production environment (loads .env.prod)
+deploy-prod: prod-env
+	@echo "Deploying production infrastructure..."
+	cd inboxflow-infrastructure && terraform init && terraform apply -var-file="terraform.prod.tfvars" -auto-approve
+
+
+============================================
+File: ./Readme.md
+Directory: .
+============================================
+# InboxFlow
+
+InboxFlow is a modular, event-driven communication automation platform. This repository contains multiple services including a Lambda-based IMAP sync module, an API, a frontend, and more.
+
+## Table of Contents
+- [Project Structure](#project-structure)
+- [Automated Local Environment Setup](#automated-local-environment-setup)
+- [Building, Packaging, and Deployment](#building-packaging-and-deployment)
+- [Running and Testing Services](#running-and-testing-services)
+- [Unified Environment Startup](#unified-environment-startup)
+- [Production Deployment](#production-deployment)
+- [Additional Notes](#additional-notes)
+
+---
+
+## Project Structure
+
+- **inboxflow_dispatcher/**: Contains the Dispatcher Service.
+- **inboxflow_imap-sync/**: Contains the IMAP sync service.
+- **inboxflow_api/**: Contains the API service.
+- **inboxflow_frontend/**: Contains the frontend UI.
+- **inboxflow_infrastructure/**: Contains Terraform configurations for infrastructure.
+- **inboxflow_docker-compose/**: Contains Docker Compose configuration (e.g., for the Postgres database).
+- **Makefile**: Contains targets for building, running, testing services, packaging the Lambda function, and deploying via Terraform.
+
+---
+
+## Automated Local Environment Setup
+
+1. **Environment Configuration**  
+   Ensure you have a `.env` file in the project root with your local environment variables.
+
+2. **Starting LocalStack**  
+   Run:  
+   ```make localstack-up```  
+   This command starts LocalStack with the Docker socket mounted so that Lambda functions can run using Docker.
+
+3. **Starting the Database**  
+   Instead of manually switching to the docker-compose directory, use:  
+   ```make run-db```  
+   This target uses Docker Compose (with the configuration in the ```inboxflow_docker-compose``` folder) to start the Postgres container and mount the migration file for automatic initialization.  
+   **Note:** The migration file is automatically applied only when the database is created (i.e., when the data volume is empty).
+
+---
+
+## Building, Packaging, and Deployment
+
+- **Packaging the Lambda Function**  
+  Run:  
+  ```make package-lambda```  
+  This packages your IMAP sync Lambda function.
+
+- **Deploying with Terraform**  
+  Run:  
+  ```make deploy-lambda```  
+  This deploys your Lambda and associated infrastructure (using LocalStack endpoints).
+
+- **Building All Services**  
+  Run:  
+  ```make build-all```  
+  This builds Docker images for all services (including database migration if applicable).
+
+---
+
+## Running and Testing Services
+
+- **Running All Services**  
+  Run:  
+  ```make run-all```  
+  This target now includes starting the database (via ```run-db```), the dispatcher, API, frontend, and flows services.
+
+- **Running Tests**  
+  Run:  
+  ```make test-all```  
+  This executes test suites for all services.
+
+---
+
+## Unified Environment Startup
+
+To streamline your workflow and reduce the number of steps, you can now start the entire local environment with just one command. The new setup ensures that LocalStack, the Postgres database (with automatic migration), and all services are started together. Simply run:
+
+```make run-all```
+
+This command will:
+- Start the Postgres database container using Docker Compose (via the ```run-db``` target).
+- Build and start all services (dispatcher, API, frontend, flows, etc.).
+- Ensure that the migration file is mounted and applied automatically on first run.
+
+---
+
+## Production Deployment
+
+For production deployment:
+- Create a production environment file (e.g., ```.env.prod```) with real AWS credentials and settings.
+- Update Terraform variable files as needed.
+- Run:  
+  ```make deploy-prod```
+
+---
+
+## Additional Notes
+
+- **Environment Switching:**  
+  Use ```make local-env``` for local settings and ```make prod-env``` (if configured) for production settings.
+
+- **Automation:**  
+  The Makefile automates environment setup, migration, building, and running services. This can be integrated into your CI/CD pipeline.
+
+- **Resource Exposure:**  
+  The frontend is publicly exposed while backend resources remain secured.
+
+
+============================================
+File: ./event.json
+Directory: .
+============================================
+{}
+
+
+============================================
+File: ./inboxflow-api/Dockerfile
+Directory: ./inboxflow-api
+============================================
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+
+============================================
+File: ./inboxflow-api/README.md
+Directory: ./inboxflow-api
+============================================
+# InboxFlow API Service
+
+## Overview
+This API serves as the backend for InboxFlow, exposing endpoints for email management, approvals, and IMAP sync.
+
+## Setup
+
+### 1. Build the Docker Image
+```bash
+docker build -t inboxflow-api .
+```
+
+### 2. Run the API Service
+```bash
+docker run --rm --name inboxflow-api --network inboxflow-network -p 8000:8000 --env-file .env inboxflow-api
+```
+
+### 3. Check If API is Running
+```bash
+curl -X GET http://localhost:8000/emails
+```
+
+
+
+============================================
+File: ./inboxflow-api/api.py
+Directory: ./inboxflow-api
+============================================
+from fastapi import FastAPI, HTTPException, Query
+import psycopg2
+from config import DB_URL
+
+app = FastAPI()
+
+def get_db_connection():
+    return psycopg2.connect(DB_URL)
+
+@app.get("/emails")
+def get_emails(filter: str = "all", limit: int = 20, offset: int = 0):
+    """Retrieve emails with pagination and filtering."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "SELECT id, subject, content, status FROM emails"
+    
+    if filter == "work-related":
+        query += " WHERE subject ILIKE '%recruiter%' OR subject ILIKE '%job%'"
+    
+    query += " ORDER BY received_at DESC LIMIT %s OFFSET %s"
+    cursor.execute(query, (limit, offset))
+    emails = cursor.fetchall()
+    
+    conn.close()
+    return [{"id": e[0], "subject": e[1], "content": e[2], "status": e[3]} for e in emails]
+
+@app.post("/emails/{id}/decision")
+def decide_email(id: str, decision: str, edited_response: str = None):
+    """Approve, reject, skip, or manually edit AI-generated response."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if decision == "Y":
+        cursor.execute("UPDATE emails SET status = 'approved' WHERE id = %s", (id,))
+    elif decision == "N":
+        cursor.execute("UPDATE emails SET status = 'rejected' WHERE id = %s", (id,))
+    elif decision == "S":
+        cursor.execute("UPDATE emails SET status = 'skipped' WHERE id = %s", (id,))
+    elif decision == "M" and edited_response:
+        cursor.execute("UPDATE emails SET status = 'edited', content = %s WHERE id = %s", (edited_response, id))
+    else:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid decision value")
+
+    conn.commit()
+    conn.close()
+    return {"message": "Decision processed successfully"}
+
+@app.post("/sync-emails")
+def sync_emails():
+    """Triggers manual email sync from IMAP."""
+    return {"message": "Sync started. Fetching unread emails from IMAP."}
+
+
+
+============================================
+File: ./inboxflow-api/config.py
+Directory: ./inboxflow-api
+============================================
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_URL = os.getenv("DB_URL")
+EMAIL_SERVER = os.getenv("EMAIL_SERVER")
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+REACT_APP_API_URL = os.getenv("REACT_APP_API_URL")
+
+
+
+============================================
+File: ./inboxflow-api/requirements.txt
+Directory: ./inboxflow-api
+============================================
+fastapi
+uvicorn
+psycopg2-binary
+python-dotenv
+
+
+============================================
+File: ./inboxflow-api/tests/test_inboxflow-api.py
+Directory: ./inboxflow-api/tests
+============================================
+import pytest
+from fastapi.testclient import TestClient
+from inboxflow_api.api import app
+
+client = TestClient(app)
+
+def test_get_emails():
+    response = client.get("/emails")
+    assert response.status_code == 200
+
+
+
+============================================
+File: ./inboxflow-ci-cd/README.md
+Directory: ./inboxflow-ci-cd
+============================================
+# InboxFlow CI/CD
+
+Configuration for automating builds, testing, and deployments.
+
+## Setup
+
+1. Configure GitHub Actions secrets for AWS credentials.
+2. Push to the repository to trigger the CI/CD pipeline.
+3. Monitor deployments via GitHub Actions dashboard.
+
+
+
+============================================
+File: ./inboxflow-ci-cd/deploy-backend.sh
+Directory: ./inboxflow-ci-cd
+============================================
+#!/bin/bash
+set -e
+
+echo "Building and deploying backend..."
+
+docker build -t inboxflow-backend .
+
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+
+docker tag inboxflow-backend:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/inboxflow-backend:latest
+docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/inboxflow-backend:latest
+
+echo "Deployment complete."
+
+
+
+============================================
+File: ./inboxflow-ci-cd/deploy-frontend.sh
+Directory: ./inboxflow-ci-cd
+============================================
+#!/bin/bash
+set -e
+
+echo "Building and deploying frontend..."
+
+npm run build
+
+aws s3 sync build/ s3://inboxflow-frontend --delete
+
+echo "Deployment complete."
+
+
+
+============================================
+File: ./inboxflow-db/README.md
+Directory: ./inboxflow-db
+============================================
+# InboxFlow Database Schema Updates
+
+## Overview
+This migration script updates the database schema to support email flows, filtering, and tracking email syncs.
+
+## Running the Migration
+
+### 1. Ensure PostgreSQL is Running
+```bash
+docker ps | grep postgres
+```
+
+### 2. Run the Migration
+```bash
+docker exec -it inboxflow-postgres psql -U user -d inboxflow -f migration.sql
+```
+
+### 3. Verify the Changes
+```bash
+docker exec -it inboxflow-postgres psql -U user -d inboxflow -c "\dt"
+```
+
+
+
+============================================
+File: ./inboxflow-db/migration.sql
+Directory: ./inboxflow-db
+============================================
+-- Create the emails table if it doesn't exist
+CREATE TABLE IF NOT EXISTS emails (
+    id SERIAL PRIMARY KEY,
+    subject TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    received_at TIMESTAMP DEFAULT NOW(),
+    content TEXT,
+    status TEXT DEFAULT 'pending'
+);
+
+-- Now add the last_synced column if it's not already there
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS last_synced TIMESTAMP DEFAULT NOW();
+
+-- Existing migrations for other tables
+CREATE TABLE IF NOT EXISTS email_flows (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    json_config JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS email_statuses (
+    id SERIAL PRIMARY KEY,
+    email_id TEXT UNIQUE NOT NULL,
+    flow_id INT REFERENCES email_flows(id),
+    status TEXT NOT NULL DEFAULT 'pending'
+);
+
+CREATE TABLE IF NOT EXISTS saved_filters (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL UNIQUE,
+    json_config JSONB NOT NULL
+);
+
+
+============================================
+File: ./inboxflow-docker-compose/README.md
+Directory: ./inboxflow-docker-compose
+============================================
+# InboxFlow Docker Compose for Local PostgreSQL
+
+This `docker-compose.yml` file sets up a local PostgreSQL database for InboxFlow.
+
+## Services
+
+- **postgres**: A PostgreSQL container configured with:
+  - **User**: user
+  - **Password**: pass
+  - **Database**: inboxflow
+
+The container exposes **port 5432** for connectivity and uses a persistent volume `postgres-data`.
+
+## Usage
+
+1. **Start the database**:
+   ```bash
+   docker-compose up -d
+   ```
+
+2. **Stop the database**:
+   ```bash
+   docker-compose down
+   ```
+
+3. **Check logs**:
+   ```bash
+   docker-compose logs postgres
+   ```
+
+4. **Access PostgreSQL CLI**:
+   ```bash
+   docker exec -it inboxflow-postgres psql -U user -d inboxflow
+   ```
+
+5. **Delete all data** (if needed):
+   ```bash
+   docker volume rm inboxflow-docker-compose_postgres-data
+   ```
+
+
+
+============================================
+File: ./inboxflow-docker-compose/docker-compose.yml
+Directory: ./inboxflow-docker-compose
+============================================
+version: "3.8"
+services:
+  postgres:
+    image: postgres:13
+    container_name: inboxflow-postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: inboxflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../inboxflow-db/migration.sql:/docker-entrypoint-initdb.d/migration.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      inboxflow-network:
+        aliases:
+          - inboxflow-postgres
+
+volumes:
+  postgres-data:
+
+networks:
+  inboxflow-network:
+    name: inboxflow-network
+    driver: bridge
+
+
+============================================
+File: ./inboxflow-docs/README.md
+Directory: ./inboxflow-docs
+============================================
+# InboxFlow Documentation
+
+Comprehensive documentation for the InboxFlow project.
+
+## Contents
+
+- **architecture.md** - Overview of system design and architecture.
+- **setup-guide.md** - Step-by-step guide to setting up InboxFlow locally and on AWS.
+- **aws-costs.md** - Breakdown of AWS services used and cost estimates.
+- **use-cases.md** - Details on the supported workflows (Tech Recruiter, Real Estate, Customer Service, Contracting).
+- **api-docs.md** - API reference for developers.
+
+
+
+============================================
+File: ./inboxflow-docs/api-docs.md
+Directory: ./inboxflow-docs
+============================================
+# API Reference
+
+## Endpoints
+
+### GET /emails
+- Lists pending emails.
+
+### POST /emails
+- Creates a new email record.
+
+### GET /emails/{email_id}
+- Retrieves details for a specific email.
+
+## Authentication
+- API keys required for secure access.
+
+
+
+============================================
+File: ./inboxflow-docs/architecture.md
+Directory: ./inboxflow-docs
+============================================
+# InboxFlow Architecture
+
+## Overview
+
+InboxFlow is designed as a modular, event-driven communication automation system leveraging AWS serverless and autoscaling technologies.
+
+### Core Components
+
+1. **Dispatcher Service** (Polls inbox, enqueues tasks to SQS)
+2. **Worker Service** (Processes tasks, applies AI/NLP, generates responses)
+3. **API Service** (Exposes RESTful endpoints for interaction)
+4. **Frontend Service** (React-based UI for users)
+5. **Infrastructure** (Terraform-managed AWS setup: ECS, Lambda, API Gateway, Aurora Serverless)
+6. **CI/CD Pipelines** (Automated builds and deployments)
+
+
+
+============================================
+File: ./inboxflow-docs/aws-costs.md
+Directory: ./inboxflow-docs
+============================================
+# AWS Cost Estimates
+
+## Services & Estimated Costs
+
+| Service              | Estimated Cost (1 User) | Estimated Cost (10 Users) | Estimated Cost (100 Users) |
+|----------------------|------------------------|--------------------------|--------------------------|
+| ECS/Fargate         | \$10                    | \$50                      | \$500                      |
+| AWS Lambda          | \$2                     | \$5                        | \$10                        |
+| API Gateway         | \$2                     | \$10                       | \$50                        |
+| S3 & CloudFront     | \$1                     | \$3                        | \$8                         |
+| SNS & SQS          | \$1                     | \$3                        | \$10                        |
+| Aurora Serverless   | \$3â€“\$5                 | \$10â€“\$15                  | \$30â€“\$40                   |
+| CloudWatch          | \$3â€“\$5                 | \$10                       | \$20                        |
+| ECR                 | \$1                     | \$1                        | \$1                         |
+| **Total**          | **\$22â€“\$28**           | **~\$114**                 | **~\$675**                  |
+
+## Cost Reduction Strategies
+
+- Use **Aurora Serverless**, which scales to zero when idle.
+- Autoscale **ECS/Fargate** workers, ensuring no idle compute charges.
+- Optimize **API Gateway** with caching and request throttling.
+- Minimize log storage in **CloudWatch**.
+
+
+
+============================================
+File: ./inboxflow-docs/setup-guide.md
+Directory: ./inboxflow-docs
+============================================
+# InboxFlow Setup Guide
+
+## Local Development
+
+### Prerequisites
+
+- Docker & Docker Compose installed
+- Python 3.8+ (For backend services)
+- Node.js 16+ (For frontend)
+- AWS CLI configured (for deployment)
+
+### Steps
+
+1. Clone and set up each service repository.
+2. Use Docker Compose to start all services locally.
+3. Run tests to verify the setup.
+
+## AWS Deployment
+
+1. Use Terraform to provision infrastructure (`inboxflow-infrastructure` repository).
+2. Deploy backend services to ECS/Fargate.
+3. Deploy frontend to S3/CloudFront.
+4. Configure CI/CD for automatic deployments.
+
+
+
+============================================
+File: ./inboxflow-docs/use-cases.md
+Directory: ./inboxflow-docs
+============================================
+# Supported Use Cases
+
+## 1. Tech Recruiter Flow
+- Extracts pay rate, remote status, and job details.
+- Auto-generates responses (accept, negotiate, request more details).
+
+## 2. Real Estate Wholesaling Flow
+- Processes property inquiry emails, extracts details.
+- Generates follow-ups or offer messages.
+
+## 3. Customer Service Flow
+- Classifies and auto-responds to customer inquiries.
+- Escalates complex cases.
+
+## 4. Contracting Jobs Flow
+- Handles incoming project inquiries and RFPs.
+- Generates pricing estimates and follow-ups.
+
+
+
+============================================
+File: ./inboxflow-flows/Dockerfile
+Directory: ./inboxflow-flows
+============================================
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "flows_manager.py"]
+
+
+
+============================================
+File: ./inboxflow-flows/README.md
+Directory: ./inboxflow-flows
+============================================
+# InboxFlow Email Processing Flows
+
+## Overview
+This module manages user-defined email processing flows, allowing users to create custom automation for different email types.
+
+## Example Flows
+- **Recruiter Email Flow:** Determines if an email is a job opportunity and generates responses.
+- **Real Estate Lead Flow:** Filters investment-related emails and prompts for property details.
+
+## Managing Flows
+### 1. Load an Existing Flow
+```python
+from flows_manager import load_flow
+flow = load_flow("recruiter_flow")
+print(flow)
+```
+
+### 2. Save a New Flow
+```python
+from flows_manager import save_flow
+new_flow = {
+  "name": "Sales Lead Flow",
+  "conditions": {
+    "subject_contains": ["lead", "customer inquiry"],
+    "sender_contains": ["@sales.com"]
+  },
+  "actions": [{"if": "AI_confirms_sales_lead", "then": {"generate_response": "Follow-up with the lead."}}]
+}
+save_flow("sales_lead", new_flow)
+```
+
+
+
+============================================
+File: ./inboxflow-flows/config.py
+Directory: ./inboxflow-flows
+============================================
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_URL = os.getenv("DB_URL")
+EMAIL_SERVER = os.getenv("EMAIL_SERVER")
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+REACT_APP_API_URL = os.getenv("REACT_APP_API_URL")
+
+
+
+============================================
+File: ./inboxflow-flows/flows_manager.py
+Directory: ./inboxflow-flows
+============================================
+import json
+import os
+
+FLOW_DIR = "flows/"
+
+def load_flow(flow_name):
+    """Load a flow by name."""
+    flow_path = os.path.join(FLOW_DIR, f"{flow_name}.json")
+    if not os.path.exists(flow_path):
+        return None
+    with open(flow_path, "r") as f:
+        return json.load(f)
+
+def save_flow(flow_name, flow_data):
+    """Save a flow to JSON."""
+    os.makedirs(FLOW_DIR, exist_ok=True)
+    flow_path = os.path.join(FLOW_DIR, f"{flow_name}.json")
+    with open(flow_path, "w") as f:
+        json.dump(flow_data, f, indent=2)
+    return True
+
+
+
+============================================
+File: ./inboxflow-flows/real_estate_flow.json
+Directory: ./inboxflow-flows
+============================================
+{
+  "name": "Real Estate Lead Flow",
+  "conditions": {
+    "subject_contains": ["property", "investment", "real estate"],
+    "sender_contains": ["@realestate.com", "@investors.com"]
+  },
+  "actions": [
+    {
+      "step": 1,
+      "if": "AI_confirms_real_estate_lead",
+      "then": {
+        "generate_response": "Ask about the property details and price range."
+      }
+    }
+  ],
+  "approval_required": true
+}
+
+
+
+============================================
+File: ./inboxflow-flows/recruiter_flow.json
+Directory: ./inboxflow-flows
+============================================
+{
+  "name": "Recruiter Email Flow",
+  "conditions": {
+    "subject_contains": ["recruiter", "job opportunity", "hiring"],
+    "sender_contains": ["@hiring.com", "@recruiters.com"]
+  },
+  "actions": [
+    {
+      "step": 1,
+      "if": "AI_confirms_recruiter_email",
+      "then": {
+        "generate_response": "Ask if the job is remote and how much it pays."
+      }
+    },
+    {
+      "step": 2,
+      "if": "response_received",
+      "then": {
+        "evaluate": "If pay is greater than $85/hr and remote, accept."
+      }
+    },
+    {
+      "step": 3,
+      "if": "pay_is_below_85",
+      "then": {
+        "generate_response": "Negotiate for $80/hr minimum."
+      }
+    }
+  ],
+  "approval_required": true
+}
+
+
+
+============================================
+File: ./inboxflow-flows/requirements.txt
+Directory: ./inboxflow-flows
+============================================
+flask
+
+
+
+============================================
+File: ./inboxflow-flows/tests/test_inboxflow-flows.py
+Directory: ./inboxflow-flows/tests
+============================================
+import pytest
+from inboxflow_flows.flows_manager import load_flow
+
+def test_load_recruiter_flow():
+    flow = load_flow("recruiter_flow")
+    assert flow is not None
+
+
+
+============================================
+File: ./inboxflow-frontend/Dockerfile
+Directory: ./inboxflow-frontend
+============================================
+FROM node:16-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm install
+COPY . .
+CMD ["npm", "start"]
+
+
+
+============================================
+File: ./inboxflow-frontend/package.json
+Directory: ./inboxflow-frontend
+============================================
+{
+  "name": "inboxflow-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "react-scripts": "5.0.1",
+    "axios": "^1.3.5"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test --watchAll=false",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+
+
+
+============================================
+File: ./inboxflow-frontend/public/index.html
+Directory: ./inboxflow-frontend/public
+============================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InboxFlow</title>
+</head>
+<body>
+    <div id="root"></div>
+</body>
+</html>
+
+
+
+============================================
+File: ./inboxflow-frontend/src/App.js
+Directory: ./inboxflow-frontend/src
+============================================
+import React from 'react';
+
+function App() {
+  return (
+    <div>
+      <h1>InboxFlow</h1>
+      <p>Your email automation system is up and running!</p>
+    </div>
+  );
+}
+
+export default App;
+
+
+
+============================================
+File: ./inboxflow-frontend/src/index.js
+Directory: ./inboxflow-frontend/src
+============================================
+import React from 'react';
+import ReactDOM from 'react-dom';
+import App from './App';
+
+ReactDOM.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+  document.getElementById('root')
+);
+
+
+
+============================================
+File: ./inboxflow-imap-sync/Dockerfile
+Directory: ./inboxflow-imap-sync
+============================================
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "imap_sync.py"]
+
+
+============================================
+File: ./inboxflow-imap-sync/README.md
+Directory: ./inboxflow-imap-sync
+============================================
+# InboxFlow IMAP Sync Service
+
+## Overview
+This service connects to the IMAP server, fetches unread emails, and stores them in PostgreSQL.
+
+## Setup
+
+### 1. Build the Docker Image
+```bash
+docker build -t inboxflow-imap-sync .
+```
+
+### 2. Run the IMAP Sync Service
+```bash
+docker run --rm --name inboxflow-imap-sync --network inboxflow-network --env-file .env inboxflow-imap-sync
+```
+
+### 3. Check Logs
+```bash
+docker logs inboxflow-imap-sync --follow
+```
+
+
+
+============================================
+File: ./inboxflow-imap-sync/config.py
+Directory: ./inboxflow-imap-sync
+============================================
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_URL = os.getenv("DB_URL")
+EMAIL_SERVER = os.getenv("EMAIL_SERVER")
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+REACT_APP_API_URL = os.getenv("REACT_APP_API_URL")
+
+
+
+============================================
+File: ./inboxflow-imap-sync/imap_sync.py
+Directory: ./inboxflow-imap-sync
+============================================
+import asyncio
+import aioimaplib
+import asyncpg
+import logging
+import os
+import boto3
+import json
+from email.parser import BytesParser
+
+# Configuration from environment or defaults
+EMAIL_SERVER = os.getenv("EMAIL_SERVER", "imap.mail.yahoo.com")
+EMAIL_USER = os.getenv("EMAIL_USER", "you@example.com")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "REDACTED_APP_PASSWORD")  # app password
+DB_URL = os.getenv("DB_URL")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
+LAMBDA_FUNCTION_NAME = os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+async def connect_imap():
+    """
+    Establish and return an asynchronous IMAP connection using aioimaplib.
+    Retries on failure.
+    """
+    try:
+        client = aioimaplib.IMAP4_SSL(EMAIL_SERVER)
+        await client.wait_hello_from_server()
+        await client.login(EMAIL_USER, EMAIL_PASSWORD)
+        await client.select("INBOX")
+        logger.info("Connected to IMAP server.")
+        return client
+    except Exception as e:
+        logger.error(f"IMAP connection error: {e}. Retrying in 10 seconds...")
+        await asyncio.sleep(10)
+        return await connect_imap()
+
+async def fetch_uids(client):
+    """
+    Fetch all message UIDs from the server.
+    """
+    resp = await client.uid("SEARCH", "ALL")
+    if resp.result != 'OK':
+        logger.error("Error fetching UIDs.")
+        return []
+    # Combine response lines and split into UIDs.
+    uids_line = b" ".join(resp.lines).decode()
+    uids = uids_line.split()
+    return uids
+
+async def bulk_fetch_headers(client, uid_list):
+    """
+    Fetch email headers in bulk (FROM, SUBJECT, DATE) for the given list of UIDs.
+    Here we concurrently pipeline header fetches.
+    """
+    headers = {}
+    async def fetch_header(uid):
+        resp = await client.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+        if resp.result == 'OK' and resp.lines:
+            header = b" ".join(resp.lines).decode(errors="ignore")
+            headers[uid] = header
+        else:
+            logger.error(f"Failed to fetch header for UID {uid}")
+    await asyncio.gather(*(fetch_header(uid) for uid in uid_list))
+    return headers
+
+async def fetch_full_email(client, uid):
+    """
+    Fetch the full email (RFC822) for a given UID.
+    """
+    resp = await client.uid("FETCH", uid, "(RFC822)")
+    if resp.result == 'OK' and resp.lines:
+        raw_email = b"".join(resp.lines)
+        return raw_email
+    else:
+        logger.error(f"Failed to fetch full email for UID {uid}")
+        return None
+
+async def fetch_and_process(client, uid, db_pool):
+    """
+    For a given UID, fetch the full email, parse it, and store it in the database.
+    """
+    raw_email = await fetch_full_email(client, uid)
+    if raw_email:
+        try:
+            msg = BytesParser().parsebytes(raw_email)
+            subject = msg.get("Subject", "No Subject")
+            sender = msg.get("From", "Unknown Sender")
+            content = raw_email.decode("utf-8", errors="ignore")
+        except Exception as e:
+            logger.error(f"Error parsing email {uid}: {e}")
+            subject = "Parsing Error"
+            sender = "Parsing Error"
+            content = raw_email.decode("utf-8", errors="ignore")
+        async with db_pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO emails (id, subject, sender, content, status)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    uid, subject, sender, content, "pending"
+                )
+                logger.info(f"Email {uid} inserted into DB.")
+            except Exception as e:
+                logger.error(f"DB insertion error for email {uid}: {e}")
+
+async def process_batch(uid_batch, db_pool):
+    """
+    Process a batch of UIDs concurrently:
+      - Optionally fetch headers for preliminary filtering/display.
+      - Concurrently fetch full emails and store them.
+    """
+    client = await connect_imap()
+    if not client:
+        logger.error("IMAP client connection failed for batch processing.")
+        return
+
+    # Fetch headers concurrently (this can be used for lightweight processing if desired)
+    headers = await bulk_fetch_headers(client, uid_batch)
+    logger.info(f"Fetched headers for UIDs: {list(headers.keys())}")
+
+    # Concurrently fetch and process each email in the batch
+    await asyncio.gather(*(fetch_and_process(client, uid, db_pool) for uid in uid_batch))
+
+    await client.logout()
+
+async def cleanup_deleted_emails(all_server_uids, db_pool):
+    """
+    Remove emails from the database that are no longer present on the server.
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id FROM emails")
+        db_uids = {row["id"] for row in rows}
+        server_uids_set = set(all_server_uids)
+        uids_to_delete = db_uids - server_uids_set
+        for uid in uids_to_delete:
+            try:
+                await conn.execute("DELETE FROM emails WHERE id = $1", uid)
+                logger.info(f"Email {uid} deleted from DB (cleanup).")
+            except Exception as e:
+                logger.error(f"DB deletion error for email {uid}: {e}")
+
+async def invoke_lambda(next_index):
+    """
+    Asynchronously re-invoke the AWS Lambda function for the next batch.
+    """
+    lambda_client = boto3.client("lambda")
+    payload = {"start_index": next_index}
+    try:
+        response = lambda_client.invoke(
+            FunctionName=LAMBDA_FUNCTION_NAME,
+            InvocationType="Event",
+            Payload=json.dumps(payload)
+        )
+        logger.info(f"Lambda re-invoked for batch starting at index {next_index}: {response}")
+    except Exception as e:
+        logger.error(f"Failed to invoke Lambda for next batch: {e}")
+
+async def main_handler(event):
+    """
+    Main asynchronous handler:
+      - Connects to IMAP to retrieve all UIDs.
+      - Processes emails in batches using asynchronous techniques.
+      - Cleans up deleted emails.
+      - Re-invokes Lambda if additional batches remain.
+    """
+    start_index = int(event.get("start_index", 0))
+    logger.info(f"Lambda invoked with start_index: {start_index}")
+
+    # Initial connection to get all UIDs
+    client = await connect_imap()
+    uids = await fetch_uids(client)
+    total_msgs = len(uids)
+    logger.info(f"Total emails on server: {total_msgs}")
+    await client.logout()
+
+    # Set up asynchronous database connection pool
+    db_pool = await asyncpg.create_pool(DB_URL)
+    try:
+        for i in range(start_index, total_msgs, BATCH_SIZE):
+            uid_batch = uids[i:i+BATCH_SIZE]
+            await process_batch(uid_batch, db_pool)
+            # If there are more emails, re-invoke Lambda for the next batch
+            if i + BATCH_SIZE < total_msgs:
+                await invoke_lambda(i + BATCH_SIZE)
+    finally:
+        await cleanup_deleted_emails(uids, db_pool)
+        await db_pool.close()
+
+    return {"status": "completed", "processed": total_msgs, "total": total_msgs}
+
+def lambda_handler(event, context):
+    return asyncio.run(main_handler(event))
+
+if __name__ == "__main__":
+    # For local testing:
+    test_event = {"start_index": 0}
+    result = asyncio.run(main_handler(test_event))
+    print(result)
+
+
+============================================
+File: ./inboxflow-imap-sync/requirements.txt
+Directory: ./inboxflow-imap-sync
+============================================
+aioimaplib
+asyncpg
+boto3
+
+
+============================================
+File: ./inboxflow-imap-sync/test.py
+Directory: ./inboxflow-imap-sync
+============================================
+import imaplib
+
+EMAIL_SERVER = "imap.mail.yahoo.com"
+EMAIL_USER = "you@example.com"
+EMAIL_PASSWORD = "REDACTED_APP_PASSWORD"  # app password
+
+try:
+    # Connect using IMAP over SSL on port 993
+    mail = imaplib.IMAP4_SSL(EMAIL_SERVER, 993)
+    mail.login(EMAIL_USER, EMAIL_PASSWORD)
+    print("Logged in successfully!")
+    mail.logout()
+except Exception as e:
+    print("Error:", e)
+
+
+============================================
+File: ./inboxflow-imap-sync/tests/test_inboxflow-imap-sync.py
+Directory: ./inboxflow-imap-sync/tests
+============================================
+import pytest
+from inboxflow_imap_sync.imap_sync import fetch_new_emails
+
+def test_fetch_new_emails():
+    assert fetch_new_emails() is None  # Just testing execution without errors
+
+
+
+============================================
+File: ./inboxflow-infrastructure/README.md
+Directory: ./inboxflow-infrastructure
+============================================
+# InboxFlow Infrastructure
+
+Terraform configuration for provisioning AWS infrastructure.
+
+## Setup
+
+1. Initialize Terraform:
+   ```
+   terraform init
+   ```
+2. Plan changes:
+   ```
+   terraform plan
+   ```
+3. Apply changes:
+   ```
+   terraform apply
+   ```
+
+
+
+# InboxFlow Infrastructure
+
+This Terraform module defines AWS resources for the InboxFlow platform, including:
+
+- An IAM Role for Lambda functions.
+- A Lambda function for IMAP synchronization.
+- An API Gateway for the API service (example).
+
+## Setup
+
+1. **Configure Variables:**
+   Update the `.env` file or create a `terraform.tfvars` file with your AWS credentials, email settings, Lambda zip path, and DB URL.
+
+2. **Initialize Terraform:**
+   ```bash
+   cd inboxflow-infrastructure
+   terraform init
+
+
+============================================
+File: ./inboxflow-infrastructure/ecs.tf
+Directory: ./inboxflow-infrastructure
+============================================
+# File: inboxflow-infrastructure/ecs.tf
+
+# This file defines ECS resources for deploying Dockerized services (e.g., the Dispatcher).
+# Note: These resources are created only if deploy_ecs is set to true.
+
+resource "aws_ecs_cluster" "inboxflow_cluster" {
+  count = var.deploy_ecs ? 1 : 0
+  name  = "inboxflow-cluster"
+}
+
+resource "aws_iam_role" "ecs_execution_role" {
+  count = var.deploy_ecs ? 1 : 0
+  name  = "inboxflow-ecs-execution-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action    = "sts:AssumeRole",
+      Effect    = "Allow",
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
+  count      = var.deploy_ecs ? 1 : 0
+  role       = aws_iam_role.ecs_execution_role[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# Example ECS Task Definition for the Dispatcher Service
+resource "aws_ecs_task_definition" "dispatcher_task" {
+  count                   = var.deploy_ecs ? 1 : 0
+  family                  = "inboxflow_dispatcher"
+  requires_compatibilities = ["FARGATE"]
+  network_mode            = "awsvpc"
+  cpu                     = "256"
+  memory                  = "512"
+  execution_role_arn      = aws_iam_role.ecs_execution_role[0].arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "dispatcher",
+      image     = "inboxflow_dispatcher:latest",
+      essential = true,
+      portMappings = [
+        {
+          containerPort = 8080,
+          hostPort      = 8080,
+          protocol      = "tcp"
+        }
+      ]
+    }
+  ])
+}
+
+# Example ECS Service for the Dispatcher Service
+resource "aws_ecs_service" "dispatcher_service" {
+  count           = var.deploy_ecs ? 1 : 0
+  name            = "inboxflow_dispatcher-service"
+  cluster         = aws_ecs_cluster.inboxflow_cluster[0].id
+  task_definition = aws_ecs_task_definition.dispatcher_task[0].arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.ecs_subnet_ids
+    security_groups  = var.ecs_security_group_ids
+    assign_public_ip = true
+  }
+
+  depends_on = [
+    aws_ecs_cluster.inboxflow_cluster,
+    aws_iam_role_policy_attachment.ecs_execution_role_policy
+  ]
+}
+
+
+============================================
+File: ./inboxflow-infrastructure/main.tf
+Directory: ./inboxflow-infrastructure
+============================================
+############################################
+# File: inboxflow-infrastructure/main.tf
+############################################
+
+# --- Add a VPC resource for LocalStack ---
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "localstack-vpc"
+  }
+}
+
+provider "aws" {
+  region                      = var.aws_region
+  access_key                  = var.aws_access_key
+  secret_key                  = var.aws_secret_key
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+
+  endpoints {
+    lambda         = var.lambda_endpoint != "" ? var.lambda_endpoint : "http://127.0.0.1:4566"
+    s3             = var.s3_endpoint != "" ? var.s3_endpoint : "http://127.0.0.1:4566"
+    apigateway     = var.apigateway_endpoint != "" ? var.apigateway_endpoint : "http://127.0.0.1:4566"
+    sns            = "http://127.0.0.1:4566"
+    sqs            = "http://127.0.0.1:4566"
+    rds            = "http://127.0.0.1:4566"
+    iam            = "http://127.0.0.1:4566"
+    secretsmanager = "http://127.0.0.1:4566"
+    ec2            = "http://127.0.0.1:4566"  # Ensure EC2 calls go to LocalStack
+  }
+}
+
+# Note: Ensure that your .env file sets AWS_S3_FORCE_PATH_STYLE=true for LocalStack testing.
+
+# ---------------------------------------------------------------------
+# S3 Bucket for Frontend Hosting (exposed to Internet)
+# ---------------------------------------------------------------------
+resource "aws_s3_bucket" "frontend" {
+  # Use a bucket name without hyphens to avoid DNS resolution issues with LocalStack.
+  bucket = "inboxflowfrontenddev"
+  acl    = "public-read"
+
+  dynamic "website" {
+    for_each = var.use_website_configuration ? [1] : []
+    content {
+      index_document = "index.html"
+    }
+  }
+}
+
+# ---------------------------------------------------------------------
+# API Gateway for internal communication (if needed)
+# ---------------------------------------------------------------------
+resource "aws_api_gateway_rest_api" "api" {
+  name        = "InboxFlowAPI"
+  description = "API for InboxFlow backend services."
+}
+
+# ---------------------------------------------------------------------
+# SNS Topic
+# ---------------------------------------------------------------------
+resource "aws_sns_topic" "inboxflow_sns" {
+  name = "InboxFlow-SNS"
+}
+
+# ---------------------------------------------------------------------
+# SQS Queue
+# ---------------------------------------------------------------------
+resource "aws_sqs_queue" "inboxflow_sqs" {
+  name                      = "InboxFlow-SQS"
+  message_retention_seconds = 86400
+}
+
+# ---------------------------------------------------------------------
+# Aurora Serverless (PostgreSQL)
+# ---------------------------------------------------------------------
+resource "aws_rds_cluster" "aurora" {
+  count               = var.deploy_rds ? 1 : 0
+  cluster_identifier  = "inboxflow-db-cluster"
+  engine              = "aurora-postgresql"
+  engine_mode         = "serverless"
+  database_name       = "inboxflow"
+  master_username     = var.db_username
+  master_password     = var.db_password
+  skip_final_snapshot = true
+}
+
+# ---------------------------------------------------------------------
+# IAM Role for Lambda Function
+# ---------------------------------------------------------------------
+resource "aws_iam_role" "imap_sync_lambda_role" {
+  name = "imap_sync_lambda_role"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [{
+      Action    = "sts:AssumeRole",
+      Effect    = "Allow",
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+# IAM Policy Attachments for Lambda: Basic execution, VPC access, Secrets Manager access, etc.
+resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+  role       = aws_iam_role.imap_sync_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
+  role       = aws_iam_role.imap_sync_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "secretsmanager_access" {
+  role       = aws_iam_role.imap_sync_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
+}
+
+# ---------------------------------------------------------------------
+# Secrets Manager: Store sensitive values (DB_URL, EMAIL_SERVER, etc.)
+# ---------------------------------------------------------------------
+resource "aws_secretsmanager_secret" "imap_sync_secrets" {
+  name = "imap_sync_secrets"
+}
+
+resource "aws_secretsmanager_secret_version" "imap_sync_secrets_version" {
+  secret_id     = aws_secretsmanager_secret.imap_sync_secrets.id
+  secret_string = jsonencode({
+    DB_URL         = var.db_url,
+    EMAIL_SERVER   = var.email_server,
+    EMAIL_USER     = var.email_user,
+    EMAIL_PASSWORD = var.email_password
+  })
+}
+
+# ---------------------------------------------------------------------
+# Security Group for Lambda: Allow all outbound traffic
+# ---------------------------------------------------------------------
+resource "aws_security_group" "lambda_sg" {
+  name        = "inboxflow-lambda-sg"
+  description = "Security group for the Lambda function, allowing all outbound traffic"
+  vpc_id      = aws_vpc.main.id
+
+  # Outbound rule: allow all traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# ---------------------------------------------------------------------
+# Additional Resources for Internet Access
+# ---------------------------------------------------------------------
+
+# 1) Internet Gateway
+resource "aws_internet_gateway" "main_igw" {
+  vpc_id = aws_vpc.main.id
+}
+
+# 2) Public Subnet (for NAT Gateway)
+resource "aws_subnet" "public_subnet_1" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"      # <-- Adjust as needed
+  availability_zone       = "us-east-1a"       # <-- Adjust as needed
+  map_public_ip_on_launch = true
+}
+
+# 3) Public Route Table
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main_igw.id
+  }
+}
+
+# 4) Associate Public Route Table with Public Subnet
+resource "aws_route_table_association" "public_subnet_assoc" {
+  subnet_id      = aws_subnet.public_subnet_1.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+# 5) Elastic IP for NAT Gateway
+resource "aws_eip" "nat_eip" {
+  vpc = true
+}
+
+# 6) NAT Gateway
+resource "aws_nat_gateway" "main_nat_gw" {
+  allocation_id = aws_eip.nat_eip.id
+  subnet_id     = aws_subnet.public_subnet_1.id
+}
+
+# 7) Private Subnet (where Lambda runs, routes to NAT)
+resource "aws_subnet" "private_subnet_1" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"      # <-- Adjust as needed
+  availability_zone       = "us-east-1a"       # <-- Adjust as needed
+  map_public_ip_on_launch = false
+}
+
+# 8) Private Route Table (routes 0.0.0.0/0 to NAT Gateway)
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main_nat_gw.id
+  }
+}
+
+# 9) Associate Private Route Table with Private Subnet
+resource "aws_route_table_association" "private_subnet_assoc" {
+  subnet_id      = aws_subnet.private_subnet_1.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+# ---------------------------------------------------------------------
+# Lambda Function for IMAP Sync
+# ---------------------------------------------------------------------
+resource "aws_lambda_function" "imap_sync_lambda" {
+  function_name = "inboxflow-imap-sync"
+  role          = aws_iam_role.imap_sync_lambda_role.arn
+  handler       = "imap_sync.lambda_handler"
+  runtime       = "python3.9"
+  timeout       = var.lambda_timeout
+
+  filename         = var.lambda_zip_path
+  source_code_hash = filebase64sha256(abspath("${path.module}/${var.lambda_zip_path}"))
+
+  environment {
+    variables = {
+      DB_URL         = var.db_url
+      EMAIL_SERVER   = var.email_server
+      EMAIL_USER     = var.email_user
+      EMAIL_PASSWORD = var.email_password
+      BATCH_SIZE     = var.batch_size
+    }
+  }
+
+  # Updated VPC config: use the dedicated security group and the private subnet
+  vpc_config {
+    subnet_ids         = var.lambda_subnet_ids
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+}
+
+
+============================================
+File: ./inboxflow-infrastructure/outputs.tf
+Directory: ./inboxflow-infrastructure
+============================================
+output "frontend_s3_url" {
+  description = "Frontend S3 bucket URL (website or bucket domain)"
+  value       = var.use_website_configuration ? aws_s3_bucket.frontend.website_endpoint : aws_s3_bucket.frontend.bucket_domain_name
+}
+
+output "api_gateway_id" {
+  description = "ID of the API Gateway for InboxFlow API"
+  value       = aws_api_gateway_rest_api.api.id
+}
+
+output "sqs_queue_url" {
+  description = "URL of the SQS queue"
+  value       = aws_sqs_queue.inboxflow_sqs.url
+}
+
+output "aurora_endpoint" {
+  description = "Endpoint of the Aurora RDS cluster (if deployed)"
+  value       = var.deploy_rds ? aws_rds_cluster.aurora[0].endpoint : ""
+}
+
+output "imap_sync_lambda_arn" {
+  description = "ARN of the IMAP Sync Lambda function"
+  value       = aws_lambda_function.imap_sync_lambda.arn
+}
+
+
+============================================
+File: ./inboxflow-infrastructure/terraform.tfstate
+Directory: ./inboxflow-infrastructure
+============================================
+{
+  "version": 4,
+  "terraform_version": "1.5.7",
+  "serial": 167,
+  "lineage": "2ade5030-6478-e7bd-ad88-5699c13d9841",
+  "outputs": {
+    "api_gateway_id": {
+      "value": "gbfzd5d6tq",
+      "type": "string"
+    },
+    "aurora_endpoint": {
+      "value": "",
+      "type": "string"
+    },
+    "frontend_s3_url": {
+      "value": "inboxflowfrontenddev.s3.amazonaws.com",
+      "type": "string"
+    },
+    "imap_sync_lambda_arn": {
+      "value": "arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync",
+      "type": "string"
+    },
+    "sqs_queue_url": {
+      "value": "http://sqs.us-west-1.localhost.localstack.cloud:4566/000000000000/InboxFlow-SQS",
+      "type": "string"
+    }
+  },
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "aws_api_gateway_rest_api",
+      "name": "api",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "api_key_source": "HEADER",
+            "arn": "arn:aws:apigateway:us-east-1::/restapis/gbfzd5d6tq",
+            "binary_media_types": [],
+            "body": null,
+            "created_date": "2025-02-23T08:13:47Z",
+            "description": "API for InboxFlow backend services.",
+            "disable_execute_api_endpoint": false,
+            "endpoint_configuration": [
+              {
+                "types": [
+                  "EDGE"
+                ],
+                "vpc_endpoint_ids": []
+              }
+            ],
+            "execution_arn": "arn:aws:execute-api:us-east-1::gbfzd5d6tq",
+            "fail_on_warnings": null,
+            "id": "gbfzd5d6tq",
+            "minimum_compression_size": "",
+            "name": "InboxFlowAPI",
+            "parameters": null,
+            "policy": "",
+            "put_rest_api_mode": null,
+            "root_resource_id": "7prtvxumwj",
+            "tags": {},
+            "tags_all": {}
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_eip",
+      "name": "nat_eip",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "address": null,
+            "allocation_id": "eipalloc-30a77b527d4c4b1e7",
+            "arn": "arn:aws:ec2:us-east-1::elastic-ip/eipalloc-30a77b527d4c4b1e7",
+            "associate_with_private_ip": null,
+            "association_id": "eipassoc-d0aa3f870ac8d9deb",
+            "carrier_ip": "",
+            "customer_owned_ip": "",
+            "customer_owned_ipv4_pool": "",
+            "domain": "vpc",
+            "id": "eipalloc-30a77b527d4c4b1e7",
+            "instance": "",
+            "ipam_pool_id": null,
+            "network_border_group": "",
+            "network_interface": "eni-cb848bb8f5b9fff4f",
+            "private_dns": "ip-10-147-170-246.ec2.internal",
+            "private_ip": "10.147.170.246",
+            "ptr_record": "",
+            "public_dns": "ec2-127-151-167-39.compute-1.amazonaws.com",
+            "public_ip": "127.151.167.39",
+            "public_ipv4_pool": "",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc": true
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiZGVsZXRlIjoxODAwMDAwMDAwMDAsInJlYWQiOjkwMDAwMDAwMDAwMCwidXBkYXRlIjozMDAwMDAwMDAwMDB9fQ=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role",
+      "name": "imap_sync_lambda_role",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:iam::000000000000:role/imap_sync_lambda_role",
+            "assume_role_policy": "{\"Statement\":[{\"Action\":\"sts:AssumeRole\",\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"}}],\"Version\":\"2012-10-17\"}",
+            "create_date": "2025-02-23T03:53:37Z",
+            "description": "",
+            "force_detach_policies": false,
+            "id": "imap_sync_lambda_role",
+            "inline_policy": [],
+            "managed_policy_arns": [
+              "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
+              "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+              "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+            ],
+            "max_session_duration": 3600,
+            "name": "imap_sync_lambda_role",
+            "name_prefix": "",
+            "path": "/",
+            "permissions_boundary": "",
+            "tags": {},
+            "tags_all": {},
+            "unique_id": "AROAQAAAAAAAPRXYJOAHQ"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role_policy_attachment",
+      "name": "lambda_basic_execution",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "id": "imap_sync_lambda_role-20250223035337439700000005",
+            "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            "role": "imap_sync_lambda_role"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role_policy_attachment",
+      "name": "lambda_vpc_access",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "id": "imap_sync_lambda_role-20250223035337438700000003",
+            "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole",
+            "role": "imap_sync_lambda_role"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role_policy_attachment",
+      "name": "secretsmanager_access",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "id": "imap_sync_lambda_role-20250223035337439500000004",
+            "policy_arn": "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
+            "role": "imap_sync_lambda_role"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_internet_gateway",
+      "name": "main_igw",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:internet-gateway/igw-65974cd9f0f0acce4",
+            "id": "igw-65974cd9f0f0acce4",
+            "owner_id": "000000000000",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjoxMjAwMDAwMDAwMDAwLCJkZWxldGUiOjEyMDAwMDAwMDAwMDAsInVwZGF0ZSI6MTIwMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_lambda_function",
+      "name": "imap_sync_lambda",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "architectures": [
+              "x86_64"
+            ],
+            "arn": "arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync",
+            "code_sha256": "l3lJhpBsaZMSrm7v58vSMbE+TLm3maku6Sv+WlJPZJg=",
+            "code_signing_config_arn": "",
+            "dead_letter_config": [],
+            "description": "",
+            "environment": [
+              {
+                "variables": {
+                  "BATCH_SIZE": "1000",
+                  "DB_URL": "postgresql://user:pass@inboxflow-postgres:5432/inboxflow",
+                  "EMAIL_PASSWORD": "testpassword",
+                  "EMAIL_SERVER": "imap.testserver.com",
+                  "EMAIL_USER": "testuser"
+                }
+              }
+            ],
+            "ephemeral_storage": [
+              {
+                "size": 512
+              }
+            ],
+            "file_system_config": [],
+            "filename": "lambda_package.zip",
+            "function_name": "inboxflow-imap-sync",
+            "handler": "imap_sync.lambda_handler",
+            "id": "inboxflow-imap-sync",
+            "image_config": [],
+            "image_uri": "",
+            "invoke_arn": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync/invocations",
+            "kms_key_arn": "",
+            "last_modified": "2025-02-23T08:52:53.535755+0000",
+            "layers": [],
+            "logging_config": [
+              {
+                "application_log_level": "",
+                "log_format": "Text",
+                "log_group": "/aws/lambda/inboxflow-imap-sync",
+                "system_log_level": ""
+              }
+            ],
+            "memory_size": 128,
+            "package_type": "Zip",
+            "publish": false,
+            "qualified_arn": "arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync:$LATEST",
+            "qualified_invoke_arn": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync:$LATEST/invocations",
+            "replace_security_groups_on_destroy": null,
+            "replacement_security_group_ids": null,
+            "reserved_concurrent_executions": -1,
+            "role": "arn:aws:iam::000000000000:role/imap_sync_lambda_role",
+            "runtime": "python3.9",
+            "s3_bucket": null,
+            "s3_key": null,
+            "s3_object_version": null,
+            "signing_job_arn": "",
+            "signing_profile_version_arn": "",
+            "skip_destroy": false,
+            "snap_start": [],
+            "source_code_hash": "l3lJhpBsaZMSrm7v58vSMbE+TLm3maku6Sv+WlJPZJg=",
+            "source_code_size": 18544240,
+            "tags": {},
+            "tags_all": {},
+            "timeout": 900,
+            "timeouts": null,
+            "tracing_config": [
+              {
+                "mode": "PassThrough"
+              }
+            ],
+            "version": "$LATEST",
+            "vpc_config": []
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6NjAwMDAwMDAwMDAwLCJ1cGRhdGUiOjYwMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role",
+            "aws_security_group.lambda_sg"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_nat_gateway",
+      "name": "main_nat_gw",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "allocation_id": "eipalloc-30a77b527d4c4b1e7",
+            "association_id": "eipassoc-d0aa3f870ac8d9deb",
+            "connectivity_type": "public",
+            "id": "nat-ae324285d13e89c9d",
+            "network_interface_id": "eni-cb848bb8f5b9fff4f",
+            "private_ip": "10.147.170.246",
+            "public_ip": "127.151.167.39",
+            "secondary_allocation_ids": [],
+            "secondary_private_ip_address_count": 0,
+            "secondary_private_ip_addresses": [],
+            "subnet_id": "subnet-dd9429f6c3be73470",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6MTgwMDAwMDAwMDAwMCwidXBkYXRlIjo2MDAwMDAwMDAwMDB9fQ==",
+          "dependencies": [
+            "aws_eip.nat_eip",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table",
+      "name": "private_rt",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:route-table/rtb-d54dd8b4b16460499",
+            "id": "rtb-d54dd8b4b16460499",
+            "owner_id": "000000000000",
+            "propagating_vgws": [],
+            "route": [
+              {
+                "carrier_gateway_id": "",
+                "cidr_block": "0.0.0.0/0",
+                "core_network_arn": "",
+                "destination_prefix_list_id": "",
+                "egress_only_gateway_id": "",
+                "gateway_id": "",
+                "ipv6_cidr_block": "",
+                "local_gateway_id": "",
+                "nat_gateway_id": "nat-ae324285d13e89c9d",
+                "network_interface_id": "",
+                "transit_gateway_id": "",
+                "vpc_endpoint_id": "",
+                "vpc_peering_connection_id": ""
+              }
+            ],
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_eip.nat_eip",
+            "aws_nat_gateway.main_nat_gw",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table",
+      "name": "public_rt",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:route-table/rtb-e8bd43fa6c4bcd824",
+            "id": "rtb-e8bd43fa6c4bcd824",
+            "owner_id": "000000000000",
+            "propagating_vgws": [],
+            "route": [
+              {
+                "carrier_gateway_id": "",
+                "cidr_block": "0.0.0.0/0",
+                "core_network_arn": "",
+                "destination_prefix_list_id": "",
+                "egress_only_gateway_id": "",
+                "gateway_id": "igw-65974cd9f0f0acce4",
+                "ipv6_cidr_block": "",
+                "local_gateway_id": "",
+                "nat_gateway_id": "",
+                "network_interface_id": "",
+                "transit_gateway_id": "",
+                "vpc_endpoint_id": "",
+                "vpc_peering_connection_id": ""
+              }
+            ],
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_internet_gateway.main_igw",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table_association",
+      "name": "private_subnet_assoc",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "gateway_id": "",
+            "id": "rtbassoc-5187b7e515ddfafc8",
+            "route_table_id": "rtb-d54dd8b4b16460499",
+            "subnet_id": "subnet-b9c168dff653a90cd",
+            "timeouts": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_eip.nat_eip",
+            "aws_nat_gateway.main_nat_gw",
+            "aws_route_table.private_rt",
+            "aws_subnet.private_subnet_1",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table_association",
+      "name": "public_subnet_assoc",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "gateway_id": "",
+            "id": "rtbassoc-0261b39e8062d575e",
+            "route_table_id": "rtb-e8bd43fa6c4bcd824",
+            "subnet_id": "subnet-dd9429f6c3be73470",
+            "timeouts": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_internet_gateway.main_igw",
+            "aws_route_table.public_rt",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_s3_bucket",
+      "name": "frontend",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "acceleration_status": "",
+            "acl": "public-read",
+            "arn": "arn:aws:s3:::inboxflowfrontenddev",
+            "bucket": "inboxflowfrontenddev",
+            "bucket_domain_name": "inboxflowfrontenddev.s3.amazonaws.com",
+            "bucket_prefix": "",
+            "bucket_regional_domain_name": "inboxflowfrontenddev.s3.us-west-1.amazonaws.com",
+            "cors_rule": [],
+            "force_destroy": false,
+            "grant": [
+              {
+                "id": "",
+                "permissions": [
+                  "READ"
+                ],
+                "type": "Group",
+                "uri": "http://acs.amazonaws.com/groups/global/AllUsers"
+              },
+              {
+                "id": "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a",
+                "permissions": [
+                  "FULL_CONTROL"
+                ],
+                "type": "CanonicalUser",
+                "uri": ""
+              }
+            ],
+            "hosted_zone_id": "Z2F56UZL2M1ACD",
+            "id": "inboxflowfrontenddev",
+            "lifecycle_rule": [],
+            "logging": [],
+            "object_lock_configuration": [],
+            "object_lock_enabled": false,
+            "policy": "",
+            "region": "us-west-1",
+            "replication_configuration": [],
+            "request_payer": "BucketOwner",
+            "server_side_encryption_configuration": [
+              {
+                "rule": [
+                  {
+                    "apply_server_side_encryption_by_default": [
+                      {
+                        "kms_master_key_id": "",
+                        "sse_algorithm": "AES256"
+                      }
+                    ],
+                    "bucket_key_enabled": false
+                  }
+                ]
+              }
+            ],
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "versioning": [
+              {
+                "enabled": false,
+                "mfa_delete": false
+              }
+            ],
+            "website": [],
+            "website_domain": null,
+            "website_endpoint": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjoxMjAwMDAwMDAwMDAwLCJkZWxldGUiOjM2MDAwMDAwMDAwMDAsInJlYWQiOjEyMDAwMDAwMDAwMDAsInVwZGF0ZSI6MTIwMDAwMDAwMDAwMH19"
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_secretsmanager_secret",
+      "name": "imap_sync_secrets",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "description": "",
+            "force_overwrite_replica_secret": false,
+            "id": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "kms_key_id": "",
+            "name": "imap_sync_secrets",
+            "name_prefix": "",
+            "policy": "",
+            "recovery_window_in_days": 30,
+            "replica": [],
+            "tags": {},
+            "tags_all": {}
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_secretsmanager_secret_version",
+      "name": "imap_sync_secrets_version",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "has_secret_string_wo": null,
+            "id": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK|terraform-20250223044832356300000001",
+            "secret_binary": "",
+            "secret_id": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "secret_string": "{\"DB_URL\":\"postgresql://user:pass@inboxflow-postgres:5432/inboxflow\",\"EMAIL_PASSWORD\":\"testpassword\",\"EMAIL_SERVER\":\"imap.testserver.com\",\"EMAIL_USER\":\"testuser\"}",
+            "secret_string_wo": null,
+            "secret_string_wo_version": null,
+            "version_id": "terraform-20250223044832356300000001",
+            "version_stages": [
+              "AWSCURRENT"
+            ]
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_secretsmanager_secret.imap_sync_secrets"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_security_group",
+      "name": "lambda_sg",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:security-group/sg-1ae9b545eedd7f06c",
+            "description": "Security group for the Lambda function, allowing all outbound traffic",
+            "egress": [
+              {
+                "cidr_blocks": [
+                  "0.0.0.0/0"
+                ],
+                "description": "",
+                "from_port": 0,
+                "ipv6_cidr_blocks": [],
+                "prefix_list_ids": [],
+                "protocol": "-1",
+                "security_groups": [],
+                "self": false,
+                "to_port": 0
+              }
+            ],
+            "id": "sg-1ae9b545eedd7f06c",
+            "ingress": [],
+            "name": "inboxflow-lambda-sg",
+            "name_prefix": "",
+            "owner_id": "000000000000",
+            "revoke_rules_on_delete": false,
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6OTAwMDAwMDAwMDAwfSwic2NoZW1hX3ZlcnNpb24iOiIxIn0=",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_sns_topic",
+      "name": "inboxflow_sns",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "application_failure_feedback_role_arn": "",
+            "application_success_feedback_role_arn": "",
+            "application_success_feedback_sample_rate": 0,
+            "archive_policy": "",
+            "arn": "arn:aws:sns:us-east-1:000000000000:InboxFlow-SNS",
+            "beginning_archive_time": "",
+            "content_based_deduplication": false,
+            "delivery_policy": "",
+            "display_name": "",
+            "fifo_topic": false,
+            "firehose_failure_feedback_role_arn": "",
+            "firehose_success_feedback_role_arn": "",
+            "firehose_success_feedback_sample_rate": 0,
+            "http_failure_feedback_role_arn": "",
+            "http_success_feedback_role_arn": "",
+            "http_success_feedback_sample_rate": 0,
+            "id": "arn:aws:sns:us-east-1:000000000000:InboxFlow-SNS",
+            "kms_master_key_id": "",
+            "lambda_failure_feedback_role_arn": "",
+            "lambda_success_feedback_role_arn": "",
+            "lambda_success_feedback_sample_rate": 0,
+            "name": "InboxFlow-SNS",
+            "name_prefix": "",
+            "owner": "000000000000",
+            "policy": "{\"Id\":\"__default_policy_ID\",\"Statement\":[{\"Action\":[\"SNS:GetTopicAttributes\",\"SNS:SetTopicAttributes\",\"SNS:AddPermission\",\"SNS:RemovePermission\",\"SNS:DeleteTopic\",\"SNS:Subscribe\",\"SNS:ListSubscriptionsByTopic\",\"SNS:Publish\",\"SNS:Receive\"],\"Condition\":{\"StringEquals\":{\"AWS:SourceOwner\":\"000000000000\"}},\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Resource\":\"arn:aws:sns:us-east-1:000000000000:InboxFlow-SNS\",\"Sid\":\"__default_statement_ID\"}],\"Version\":\"2008-10-17\"}",
+            "signature_version": 0,
+            "sqs_failure_feedback_role_arn": "",
+            "sqs_success_feedback_role_arn": "",
+            "sqs_success_feedback_sample_rate": 0,
+            "tags": {},
+            "tags_all": {},
+            "tracing_config": ""
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_sqs_queue",
+      "name": "inboxflow_sqs",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:sqs:us-west-1:000000000000:InboxFlow-SQS",
+            "content_based_deduplication": false,
+            "deduplication_scope": "",
+            "delay_seconds": 0,
+            "fifo_queue": false,
+            "fifo_throughput_limit": "",
+            "id": "http://sqs.us-west-1.localhost.localstack.cloud:4566/000000000000/InboxFlow-SQS",
+            "kms_data_key_reuse_period_seconds": 300,
+            "kms_master_key_id": "",
+            "max_message_size": 262144,
+            "message_retention_seconds": 86400,
+            "name": "InboxFlow-SQS",
+            "name_prefix": "",
+            "policy": "",
+            "receive_wait_time_seconds": 0,
+            "redrive_allow_policy": "",
+            "redrive_policy": "",
+            "sqs_managed_sse_enabled": true,
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "url": "http://sqs.us-west-1.localhost.localstack.cloud:4566/000000000000/InboxFlow-SQS",
+            "visibility_timeout_seconds": 30
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjoxODAwMDAwMDAwMDAsImRlbGV0ZSI6MTgwMDAwMDAwMDAwLCJ1cGRhdGUiOjE4MDAwMDAwMDAwMH19"
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_subnet",
+      "name": "private_subnet_1",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:subnet/subnet-b9c168dff653a90cd",
+            "assign_ipv6_address_on_creation": false,
+            "availability_zone": "us-east-1a",
+            "availability_zone_id": "use1-az6",
+            "cidr_block": "10.0.2.0/24",
+            "customer_owned_ipv4_pool": "",
+            "enable_dns64": false,
+            "enable_lni_at_device_index": 0,
+            "enable_resource_name_dns_a_record_on_launch": false,
+            "enable_resource_name_dns_aaaa_record_on_launch": false,
+            "id": "subnet-b9c168dff653a90cd",
+            "ipv6_cidr_block": "",
+            "ipv6_cidr_block_association_id": "",
+            "ipv6_native": false,
+            "map_customer_owned_ip_on_launch": false,
+            "map_public_ip_on_launch": false,
+            "outpost_arn": "",
+            "owner_id": "000000000000",
+            "private_dns_hostname_type_on_launch": "ip-name",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6MTIwMDAwMDAwMDAwMH0sInNjaGVtYV92ZXJzaW9uIjoiMSJ9",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_subnet",
+      "name": "public_subnet_1",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:subnet/subnet-dd9429f6c3be73470",
+            "assign_ipv6_address_on_creation": false,
+            "availability_zone": "us-east-1a",
+            "availability_zone_id": "use1-az6",
+            "cidr_block": "10.0.1.0/24",
+            "customer_owned_ipv4_pool": "",
+            "enable_dns64": false,
+            "enable_lni_at_device_index": 0,
+            "enable_resource_name_dns_a_record_on_launch": false,
+            "enable_resource_name_dns_aaaa_record_on_launch": false,
+            "id": "subnet-dd9429f6c3be73470",
+            "ipv6_cidr_block": "",
+            "ipv6_cidr_block_association_id": "",
+            "ipv6_native": false,
+            "map_customer_owned_ip_on_launch": false,
+            "map_public_ip_on_launch": true,
+            "outpost_arn": "",
+            "owner_id": "000000000000",
+            "private_dns_hostname_type_on_launch": "ip-name",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6MTIwMDAwMDAwMDAwMH0sInNjaGVtYV92ZXJzaW9uIjoiMSJ9",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_vpc",
+      "name": "main",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:vpc/vpc-89d9b77a864ae38d5",
+            "assign_generated_ipv6_cidr_block": false,
+            "cidr_block": "10.0.0.0/16",
+            "default_network_acl_id": "acl-68e0599a2d145d352",
+            "default_route_table_id": "rtb-3fbe988ab804744f6",
+            "default_security_group_id": "sg-216c765341935697d",
+            "dhcp_options_id": "default",
+            "enable_dns_hostnames": true,
+            "enable_dns_support": true,
+            "enable_network_address_usage_metrics": false,
+            "id": "vpc-89d9b77a864ae38d5",
+            "instance_tenancy": "default",
+            "ipv4_ipam_pool_id": null,
+            "ipv4_netmask_length": null,
+            "ipv6_association_id": "",
+            "ipv6_cidr_block": "",
+            "ipv6_cidr_block_network_border_group": "",
+            "ipv6_ipam_pool_id": "",
+            "ipv6_netmask_length": 0,
+            "main_route_table_id": "rtb-3fbe988ab804744f6",
+            "owner_id": "000000000000",
+            "tags": {
+              "Name": "localstack-vpc"
+            },
+            "tags_all": {
+              "Name": "localstack-vpc"
+            }
+          },
+          "sensitive_attributes": [],
+          "private": "eyJzY2hlbWFfdmVyc2lvbiI6IjEifQ=="
+        }
+      ]
+    }
+  ],
+  "check_results": null
+}
+
+
+
+============================================
+File: ./inboxflow-infrastructure/terraform.tfstate.backup
+Directory: ./inboxflow-infrastructure
+============================================
+{
+  "version": 4,
+  "terraform_version": "1.5.7",
+  "serial": 165,
+  "lineage": "2ade5030-6478-e7bd-ad88-5699c13d9841",
+  "outputs": {
+    "api_gateway_id": {
+      "value": "gbfzd5d6tq",
+      "type": "string"
+    },
+    "aurora_endpoint": {
+      "value": "",
+      "type": "string"
+    },
+    "frontend_s3_url": {
+      "value": "inboxflowfrontenddev.s3.amazonaws.com",
+      "type": "string"
+    },
+    "imap_sync_lambda_arn": {
+      "value": "arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync",
+      "type": "string"
+    },
+    "sqs_queue_url": {
+      "value": "http://sqs.us-west-1.localhost.localstack.cloud:4566/000000000000/InboxFlow-SQS",
+      "type": "string"
+    }
+  },
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "aws_api_gateway_rest_api",
+      "name": "api",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "api_key_source": "HEADER",
+            "arn": "arn:aws:apigateway:us-east-1::/restapis/gbfzd5d6tq",
+            "binary_media_types": [],
+            "body": null,
+            "created_date": "2025-02-23T08:13:47Z",
+            "description": "API for InboxFlow backend services.",
+            "disable_execute_api_endpoint": false,
+            "endpoint_configuration": [
+              {
+                "types": [
+                  "EDGE"
+                ],
+                "vpc_endpoint_ids": []
+              }
+            ],
+            "execution_arn": "arn:aws:execute-api:us-east-1::gbfzd5d6tq",
+            "fail_on_warnings": null,
+            "id": "gbfzd5d6tq",
+            "minimum_compression_size": "",
+            "name": "InboxFlowAPI",
+            "parameters": null,
+            "policy": "",
+            "put_rest_api_mode": null,
+            "root_resource_id": "7prtvxumwj",
+            "tags": {},
+            "tags_all": {}
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_eip",
+      "name": "nat_eip",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "address": null,
+            "allocation_id": "eipalloc-30a77b527d4c4b1e7",
+            "arn": "arn:aws:ec2:us-east-1::elastic-ip/eipalloc-30a77b527d4c4b1e7",
+            "associate_with_private_ip": null,
+            "association_id": "eipassoc-d0aa3f870ac8d9deb",
+            "carrier_ip": "",
+            "customer_owned_ip": "",
+            "customer_owned_ipv4_pool": "",
+            "domain": "vpc",
+            "id": "eipalloc-30a77b527d4c4b1e7",
+            "instance": "",
+            "ipam_pool_id": null,
+            "network_border_group": "",
+            "network_interface": "eni-cb848bb8f5b9fff4f",
+            "private_dns": "ip-10-147-170-246.ec2.internal",
+            "private_ip": "10.147.170.246",
+            "ptr_record": "",
+            "public_dns": "ec2-127-151-167-39.compute-1.amazonaws.com",
+            "public_ip": "127.151.167.39",
+            "public_ipv4_pool": "",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc": true
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiZGVsZXRlIjoxODAwMDAwMDAwMDAsInJlYWQiOjkwMDAwMDAwMDAwMCwidXBkYXRlIjozMDAwMDAwMDAwMDB9fQ=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role",
+      "name": "imap_sync_lambda_role",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:iam::000000000000:role/imap_sync_lambda_role",
+            "assume_role_policy": "{\"Statement\":[{\"Action\":\"sts:AssumeRole\",\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"}}],\"Version\":\"2012-10-17\"}",
+            "create_date": "2025-02-23T03:53:37Z",
+            "description": "",
+            "force_detach_policies": false,
+            "id": "imap_sync_lambda_role",
+            "inline_policy": [],
+            "managed_policy_arns": [
+              "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
+              "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+              "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+            ],
+            "max_session_duration": 3600,
+            "name": "imap_sync_lambda_role",
+            "name_prefix": "",
+            "path": "/",
+            "permissions_boundary": "",
+            "tags": {},
+            "tags_all": {},
+            "unique_id": "AROAQAAAAAAAPRXYJOAHQ"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role_policy_attachment",
+      "name": "lambda_basic_execution",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "id": "imap_sync_lambda_role-20250223035337439700000005",
+            "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            "role": "imap_sync_lambda_role"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role_policy_attachment",
+      "name": "lambda_vpc_access",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "id": "imap_sync_lambda_role-20250223035337438700000003",
+            "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole",
+            "role": "imap_sync_lambda_role"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_iam_role_policy_attachment",
+      "name": "secretsmanager_access",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "id": "imap_sync_lambda_role-20250223035337439500000004",
+            "policy_arn": "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
+            "role": "imap_sync_lambda_role"
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_internet_gateway",
+      "name": "main_igw",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:internet-gateway/igw-65974cd9f0f0acce4",
+            "id": "igw-65974cd9f0f0acce4",
+            "owner_id": "000000000000",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjoxMjAwMDAwMDAwMDAwLCJkZWxldGUiOjEyMDAwMDAwMDAwMDAsInVwZGF0ZSI6MTIwMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_lambda_function",
+      "name": "imap_sync_lambda",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "architectures": [
+              "x86_64"
+            ],
+            "arn": "arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync",
+            "code_sha256": "rS7Gi46K3QnwYP3VQThhKu8+ytMxkuc1/DQdK+8nsFA=",
+            "code_signing_config_arn": "",
+            "dead_letter_config": [],
+            "description": "",
+            "environment": [
+              {
+                "variables": {
+                  "BATCH_SIZE": "1000",
+                  "DB_URL": "postgresql://user:pass@inboxflow-postgres:5432/inboxflow",
+                  "EMAIL_PASSWORD": "testpassword",
+                  "EMAIL_SERVER": "imap.testserver.com",
+                  "EMAIL_USER": "testuser"
+                }
+              }
+            ],
+            "ephemeral_storage": [
+              {
+                "size": 512
+              }
+            ],
+            "file_system_config": [],
+            "filename": "lambda_package.zip",
+            "function_name": "inboxflow-imap-sync",
+            "handler": "imap_sync.lambda_handler",
+            "id": "inboxflow-imap-sync",
+            "image_config": [],
+            "image_uri": "",
+            "invoke_arn": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync/invocations",
+            "kms_key_arn": "",
+            "last_modified": "2025-02-23T08:42:02.333338+0000",
+            "layers": [],
+            "logging_config": [
+              {
+                "application_log_level": "",
+                "log_format": "Text",
+                "log_group": "/aws/lambda/inboxflow-imap-sync",
+                "system_log_level": ""
+              }
+            ],
+            "memory_size": 128,
+            "package_type": "Zip",
+            "publish": false,
+            "qualified_arn": "arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync:$LATEST",
+            "qualified_invoke_arn": "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:inboxflow-imap-sync:$LATEST/invocations",
+            "replace_security_groups_on_destroy": null,
+            "replacement_security_group_ids": null,
+            "reserved_concurrent_executions": -1,
+            "role": "arn:aws:iam::000000000000:role/imap_sync_lambda_role",
+            "runtime": "python3.9",
+            "s3_bucket": null,
+            "s3_key": null,
+            "s3_object_version": null,
+            "signing_job_arn": "",
+            "signing_profile_version_arn": "",
+            "skip_destroy": false,
+            "snap_start": [],
+            "source_code_hash": "rS7Gi46K3QnwYP3VQThhKu8+ytMxkuc1/DQdK+8nsFA=",
+            "source_code_size": 27942168,
+            "tags": {},
+            "tags_all": {},
+            "timeout": 900,
+            "timeouts": null,
+            "tracing_config": [
+              {
+                "mode": "PassThrough"
+              }
+            ],
+            "version": "$LATEST",
+            "vpc_config": []
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6NjAwMDAwMDAwMDAwLCJ1cGRhdGUiOjYwMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_iam_role.imap_sync_lambda_role",
+            "aws_security_group.lambda_sg"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_nat_gateway",
+      "name": "main_nat_gw",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "allocation_id": "eipalloc-30a77b527d4c4b1e7",
+            "association_id": "eipassoc-d0aa3f870ac8d9deb",
+            "connectivity_type": "public",
+            "id": "nat-ae324285d13e89c9d",
+            "network_interface_id": "eni-cb848bb8f5b9fff4f",
+            "private_ip": "10.147.170.246",
+            "public_ip": "127.151.167.39",
+            "secondary_allocation_ids": [],
+            "secondary_private_ip_address_count": 0,
+            "secondary_private_ip_addresses": [],
+            "subnet_id": "subnet-dd9429f6c3be73470",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6MTgwMDAwMDAwMDAwMCwidXBkYXRlIjo2MDAwMDAwMDAwMDB9fQ==",
+          "dependencies": [
+            "aws_eip.nat_eip",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table",
+      "name": "private_rt",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:route-table/rtb-d54dd8b4b16460499",
+            "id": "rtb-d54dd8b4b16460499",
+            "owner_id": "000000000000",
+            "propagating_vgws": [],
+            "route": [
+              {
+                "carrier_gateway_id": "",
+                "cidr_block": "0.0.0.0/0",
+                "core_network_arn": "",
+                "destination_prefix_list_id": "",
+                "egress_only_gateway_id": "",
+                "gateway_id": "",
+                "ipv6_cidr_block": "",
+                "local_gateway_id": "",
+                "nat_gateway_id": "nat-ae324285d13e89c9d",
+                "network_interface_id": "",
+                "transit_gateway_id": "",
+                "vpc_endpoint_id": "",
+                "vpc_peering_connection_id": ""
+              }
+            ],
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_eip.nat_eip",
+            "aws_nat_gateway.main_nat_gw",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table",
+      "name": "public_rt",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:route-table/rtb-e8bd43fa6c4bcd824",
+            "id": "rtb-e8bd43fa6c4bcd824",
+            "owner_id": "000000000000",
+            "propagating_vgws": [],
+            "route": [
+              {
+                "carrier_gateway_id": "",
+                "cidr_block": "0.0.0.0/0",
+                "core_network_arn": "",
+                "destination_prefix_list_id": "",
+                "egress_only_gateway_id": "",
+                "gateway_id": "igw-65974cd9f0f0acce4",
+                "ipv6_cidr_block": "",
+                "local_gateway_id": "",
+                "nat_gateway_id": "",
+                "network_interface_id": "",
+                "transit_gateway_id": "",
+                "vpc_endpoint_id": "",
+                "vpc_peering_connection_id": ""
+              }
+            ],
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_internet_gateway.main_igw",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table_association",
+      "name": "private_subnet_assoc",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "gateway_id": "",
+            "id": "rtbassoc-5187b7e515ddfafc8",
+            "route_table_id": "rtb-d54dd8b4b16460499",
+            "subnet_id": "subnet-b9c168dff653a90cd",
+            "timeouts": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_eip.nat_eip",
+            "aws_nat_gateway.main_nat_gw",
+            "aws_route_table.private_rt",
+            "aws_subnet.private_subnet_1",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_route_table_association",
+      "name": "public_subnet_assoc",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "gateway_id": "",
+            "id": "rtbassoc-0261b39e8062d575e",
+            "route_table_id": "rtb-e8bd43fa6c4bcd824",
+            "subnet_id": "subnet-dd9429f6c3be73470",
+            "timeouts": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjozMDAwMDAwMDAwMDAsImRlbGV0ZSI6MzAwMDAwMDAwMDAwLCJ1cGRhdGUiOjEyMDAwMDAwMDAwMH19",
+          "dependencies": [
+            "aws_internet_gateway.main_igw",
+            "aws_route_table.public_rt",
+            "aws_subnet.public_subnet_1",
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_s3_bucket",
+      "name": "frontend",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "acceleration_status": "",
+            "acl": "public-read",
+            "arn": "arn:aws:s3:::inboxflowfrontenddev",
+            "bucket": "inboxflowfrontenddev",
+            "bucket_domain_name": "inboxflowfrontenddev.s3.amazonaws.com",
+            "bucket_prefix": "",
+            "bucket_regional_domain_name": "inboxflowfrontenddev.s3.us-west-1.amazonaws.com",
+            "cors_rule": [],
+            "force_destroy": false,
+            "grant": [
+              {
+                "id": "",
+                "permissions": [
+                  "READ"
+                ],
+                "type": "Group",
+                "uri": "http://acs.amazonaws.com/groups/global/AllUsers"
+              },
+              {
+                "id": "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a",
+                "permissions": [
+                  "FULL_CONTROL"
+                ],
+                "type": "CanonicalUser",
+                "uri": ""
+              }
+            ],
+            "hosted_zone_id": "Z2F56UZL2M1ACD",
+            "id": "inboxflowfrontenddev",
+            "lifecycle_rule": [],
+            "logging": [],
+            "object_lock_configuration": [],
+            "object_lock_enabled": false,
+            "policy": "",
+            "region": "us-west-1",
+            "replication_configuration": [],
+            "request_payer": "BucketOwner",
+            "server_side_encryption_configuration": [
+              {
+                "rule": [
+                  {
+                    "apply_server_side_encryption_by_default": [
+                      {
+                        "kms_master_key_id": "",
+                        "sse_algorithm": "AES256"
+                      }
+                    ],
+                    "bucket_key_enabled": false
+                  }
+                ]
+              }
+            ],
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "versioning": [
+              {
+                "enabled": false,
+                "mfa_delete": false
+              }
+            ],
+            "website": [],
+            "website_domain": null,
+            "website_endpoint": null
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjoxMjAwMDAwMDAwMDAwLCJkZWxldGUiOjM2MDAwMDAwMDAwMDAsInJlYWQiOjEyMDAwMDAwMDAwMDAsInVwZGF0ZSI6MTIwMDAwMDAwMDAwMH19"
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_secretsmanager_secret",
+      "name": "imap_sync_secrets",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "description": "",
+            "force_overwrite_replica_secret": false,
+            "id": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "kms_key_id": "",
+            "name": "imap_sync_secrets",
+            "name_prefix": "",
+            "policy": "",
+            "recovery_window_in_days": 30,
+            "replica": [],
+            "tags": {},
+            "tags_all": {}
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_secretsmanager_secret_version",
+      "name": "imap_sync_secrets_version",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "has_secret_string_wo": null,
+            "id": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK|terraform-20250223044832356300000001",
+            "secret_binary": "",
+            "secret_id": "arn:aws:secretsmanager:us-west-1:000000000000:secret:imap_sync_secrets-BlplRK",
+            "secret_string": "{\"DB_URL\":\"postgresql://user:pass@inboxflow-postgres:5432/inboxflow\",\"EMAIL_PASSWORD\":\"testpassword\",\"EMAIL_SERVER\":\"imap.testserver.com\",\"EMAIL_USER\":\"testuser\"}",
+            "secret_string_wo": null,
+            "secret_string_wo_version": null,
+            "version_id": "terraform-20250223044832356300000001",
+            "version_stages": [
+              "AWSCURRENT"
+            ]
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA==",
+          "dependencies": [
+            "aws_secretsmanager_secret.imap_sync_secrets"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_security_group",
+      "name": "lambda_sg",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:security-group/sg-1ae9b545eedd7f06c",
+            "description": "Security group for the Lambda function, allowing all outbound traffic",
+            "egress": [
+              {
+                "cidr_blocks": [
+                  "0.0.0.0/0"
+                ],
+                "description": "",
+                "from_port": 0,
+                "ipv6_cidr_blocks": [],
+                "prefix_list_ids": [],
+                "protocol": "-1",
+                "security_groups": [],
+                "self": false,
+                "to_port": 0
+              }
+            ],
+            "id": "sg-1ae9b545eedd7f06c",
+            "ingress": [],
+            "name": "inboxflow-lambda-sg",
+            "name_prefix": "",
+            "owner_id": "000000000000",
+            "revoke_rules_on_delete": false,
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6OTAwMDAwMDAwMDAwfSwic2NoZW1hX3ZlcnNpb24iOiIxIn0=",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_sns_topic",
+      "name": "inboxflow_sns",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "application_failure_feedback_role_arn": "",
+            "application_success_feedback_role_arn": "",
+            "application_success_feedback_sample_rate": 0,
+            "archive_policy": "",
+            "arn": "arn:aws:sns:us-east-1:000000000000:InboxFlow-SNS",
+            "beginning_archive_time": "",
+            "content_based_deduplication": false,
+            "delivery_policy": "",
+            "display_name": "",
+            "fifo_topic": false,
+            "firehose_failure_feedback_role_arn": "",
+            "firehose_success_feedback_role_arn": "",
+            "firehose_success_feedback_sample_rate": 0,
+            "http_failure_feedback_role_arn": "",
+            "http_success_feedback_role_arn": "",
+            "http_success_feedback_sample_rate": 0,
+            "id": "arn:aws:sns:us-east-1:000000000000:InboxFlow-SNS",
+            "kms_master_key_id": "",
+            "lambda_failure_feedback_role_arn": "",
+            "lambda_success_feedback_role_arn": "",
+            "lambda_success_feedback_sample_rate": 0,
+            "name": "InboxFlow-SNS",
+            "name_prefix": "",
+            "owner": "000000000000",
+            "policy": "{\"Id\":\"__default_policy_ID\",\"Statement\":[{\"Action\":[\"SNS:GetTopicAttributes\",\"SNS:SetTopicAttributes\",\"SNS:AddPermission\",\"SNS:RemovePermission\",\"SNS:DeleteTopic\",\"SNS:Subscribe\",\"SNS:ListSubscriptionsByTopic\",\"SNS:Publish\",\"SNS:Receive\"],\"Condition\":{\"StringEquals\":{\"AWS:SourceOwner\":\"000000000000\"}},\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Resource\":\"arn:aws:sns:us-east-1:000000000000:InboxFlow-SNS\",\"Sid\":\"__default_statement_ID\"}],\"Version\":\"2008-10-17\"}",
+            "signature_version": 0,
+            "sqs_failure_feedback_role_arn": "",
+            "sqs_success_feedback_role_arn": "",
+            "sqs_success_feedback_sample_rate": 0,
+            "tags": {},
+            "tags_all": {},
+            "tracing_config": ""
+          },
+          "sensitive_attributes": [],
+          "private": "bnVsbA=="
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_sqs_queue",
+      "name": "inboxflow_sqs",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "attributes": {
+            "arn": "arn:aws:sqs:us-west-1:000000000000:InboxFlow-SQS",
+            "content_based_deduplication": false,
+            "deduplication_scope": "",
+            "delay_seconds": 0,
+            "fifo_queue": false,
+            "fifo_throughput_limit": "",
+            "id": "http://sqs.us-west-1.localhost.localstack.cloud:4566/000000000000/InboxFlow-SQS",
+            "kms_data_key_reuse_period_seconds": 300,
+            "kms_master_key_id": "",
+            "max_message_size": 262144,
+            "message_retention_seconds": 86400,
+            "name": "InboxFlow-SQS",
+            "name_prefix": "",
+            "policy": "",
+            "receive_wait_time_seconds": 0,
+            "redrive_allow_policy": "",
+            "redrive_policy": "",
+            "sqs_managed_sse_enabled": true,
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "url": "http://sqs.us-west-1.localhost.localstack.cloud:4566/000000000000/InboxFlow-SQS",
+            "visibility_timeout_seconds": 30
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjoxODAwMDAwMDAwMDAsImRlbGV0ZSI6MTgwMDAwMDAwMDAwLCJ1cGRhdGUiOjE4MDAwMDAwMDAwMH19"
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_subnet",
+      "name": "private_subnet_1",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:subnet/subnet-b9c168dff653a90cd",
+            "assign_ipv6_address_on_creation": false,
+            "availability_zone": "us-east-1a",
+            "availability_zone_id": "use1-az6",
+            "cidr_block": "10.0.2.0/24",
+            "customer_owned_ipv4_pool": "",
+            "enable_dns64": false,
+            "enable_lni_at_device_index": 0,
+            "enable_resource_name_dns_a_record_on_launch": false,
+            "enable_resource_name_dns_aaaa_record_on_launch": false,
+            "id": "subnet-b9c168dff653a90cd",
+            "ipv6_cidr_block": "",
+            "ipv6_cidr_block_association_id": "",
+            "ipv6_native": false,
+            "map_customer_owned_ip_on_launch": false,
+            "map_public_ip_on_launch": false,
+            "outpost_arn": "",
+            "owner_id": "000000000000",
+            "private_dns_hostname_type_on_launch": "ip-name",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6MTIwMDAwMDAwMDAwMH0sInNjaGVtYV92ZXJzaW9uIjoiMSJ9",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_subnet",
+      "name": "public_subnet_1",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:subnet/subnet-dd9429f6c3be73470",
+            "assign_ipv6_address_on_creation": false,
+            "availability_zone": "us-east-1a",
+            "availability_zone_id": "use1-az6",
+            "cidr_block": "10.0.1.0/24",
+            "customer_owned_ipv4_pool": "",
+            "enable_dns64": false,
+            "enable_lni_at_device_index": 0,
+            "enable_resource_name_dns_a_record_on_launch": false,
+            "enable_resource_name_dns_aaaa_record_on_launch": false,
+            "id": "subnet-dd9429f6c3be73470",
+            "ipv6_cidr_block": "",
+            "ipv6_cidr_block_association_id": "",
+            "ipv6_native": false,
+            "map_customer_owned_ip_on_launch": false,
+            "map_public_ip_on_launch": true,
+            "outpost_arn": "",
+            "owner_id": "000000000000",
+            "private_dns_hostname_type_on_launch": "ip-name",
+            "tags": {},
+            "tags_all": {},
+            "timeouts": null,
+            "vpc_id": "vpc-89d9b77a864ae38d5"
+          },
+          "sensitive_attributes": [],
+          "private": "eyJlMmJmYjczMC1lY2FhLTExZTYtOGY4OC0zNDM2M2JjN2M0YzAiOnsiY3JlYXRlIjo2MDAwMDAwMDAwMDAsImRlbGV0ZSI6MTIwMDAwMDAwMDAwMH0sInNjaGVtYV92ZXJzaW9uIjoiMSJ9",
+          "dependencies": [
+            "aws_vpc.main"
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "aws_vpc",
+      "name": "main",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "arn": "arn:aws:ec2:us-east-1:000000000000:vpc/vpc-89d9b77a864ae38d5",
+            "assign_generated_ipv6_cidr_block": false,
+            "cidr_block": "10.0.0.0/16",
+            "default_network_acl_id": "acl-68e0599a2d145d352",
+            "default_route_table_id": "rtb-3fbe988ab804744f6",
+            "default_security_group_id": "sg-216c765341935697d",
+            "dhcp_options_id": "default",
+            "enable_dns_hostnames": true,
+            "enable_dns_support": true,
+            "enable_network_address_usage_metrics": false,
+            "id": "vpc-89d9b77a864ae38d5",
+            "instance_tenancy": "default",
+            "ipv4_ipam_pool_id": null,
+            "ipv4_netmask_length": null,
+            "ipv6_association_id": "",
+            "ipv6_cidr_block": "",
+            "ipv6_cidr_block_network_border_group": "",
+            "ipv6_ipam_pool_id": "",
+            "ipv6_netmask_length": 0,
+            "main_route_table_id": "rtb-3fbe988ab804744f6",
+            "owner_id": "000000000000",
+            "tags": {
+              "Name": "localstack-vpc"
+            },
+            "tags_all": {
+              "Name": "localstack-vpc"
+            }
+          },
+          "sensitive_attributes": [],
+          "private": "eyJzY2hlbWFfdmVyc2lvbiI6IjEifQ=="
+        }
+      ]
+    }
+  ],
+  "check_results": null
+}
+
+
+
+============================================
+File: ./inboxflow-infrastructure/terraform.tfvars
+Directory: ./inboxflow-infrastructure
+============================================
+lambda_zip_path = "lambda_package.zip"
+
+aws_access_key = "test"
+aws_secret_key = "test"
+aws_region     = "us-east-1"
+vpc_id         = "vpc-12345678"
+
+
+============================================
+File: ./inboxflow-infrastructure/variables.tf
+Directory: ./inboxflow-infrastructure
+============================================
+# File: inboxflow-infrastructure/variables.tf
+
+variable "aws_region" {
+  description = "AWS region to deploy resources"
+  default     = "us-west-1"
+}
+
+variable "aws_access_key" {
+  description = "AWS access key"
+  type        = string
+  default     = "dummy"
+}
+
+variable "aws_secret_key" {
+  description = "AWS secret key"
+  type        = string
+  default     = "dummy"
+}
+
+variable "db_username" {
+  description = "Database admin username"
+  default     = "admin"
+}
+
+variable "db_password" {
+  description = "Database admin password"
+  type        = string
+  sensitive   = false
+  default     = "pass"
+}
+
+variable "db_url" {
+  description = "Database connection URL"
+  type        = string
+  default     = "postgresql://user:pass@inboxflow-postgres:5432/inboxflow"
+}
+
+variable "email_server" {
+  description = "IMAP email server (e.g., imap.mail.yahoo.com)"
+  type        = string
+  default     = "imap.testserver.com"
+}
+
+variable "email_user" {
+  description = "Email user for IMAP login"
+  type        = string
+  default     = "testuser"
+}
+
+variable "email_password" {
+  description = "Email password for IMAP login"
+  type        = string
+  default     = "testpassword"
+}
+
+variable "lambda_zip_path" {
+  description = "Path to your zipped Lambda function code"
+  type        = string
+  default     = "lambda_package.zip"
+}
+
+variable "lambda_timeout" {
+  description = "Lambda function timeout in seconds"
+  default     = 900
+}
+
+variable "batch_size" {
+  description = "Batch size for processing emails in Lambda"
+  default     = 1000
+}
+
+# LocalStack endpoint variables for testing
+variable "lambda_endpoint" {
+  description = "Custom endpoint for Lambda (for local testing with LocalStack)"
+  default     = ""
+}
+
+variable "s3_endpoint" {
+  description = "Custom endpoint for S3 (for local testing with LocalStack)"
+  default     = ""
+}
+
+variable "apigateway_endpoint" {
+  description = "Custom endpoint for API Gateway (for local testing with LocalStack)"
+  default     = ""
+}
+
+# VPC configuration for Lambda (if required)
+variable "lambda_subnet_ids" {
+  description = "List of subnet IDs for the Lambda function"
+  type        = list(string)
+  default     = []
+}
+
+variable "lambda_security_group_ids" {
+  description = "List of security group IDs for the Lambda function"
+  type        = list(string)
+  default     = []
+}
+
+# ECS Variables for deploying additional Dockerized services
+variable "ecs_subnet_ids" {
+  description = "List of subnet IDs for ECS services"
+  type        = list(string)
+  default     = []  # Set your local or production subnet IDs here
+}
+
+variable "ecs_security_group_ids" {
+  description = "List of security group IDs for ECS services"
+  type        = list(string)
+  default     = []  # Set your local or production security group IDs here
+}
+
+variable "deploy_ecs" {
+  description = "Deploy ECS resources? Set to true for production, false for local testing."
+  type        = bool
+  default     = false
+}
+
+# New variable: whether to deploy RDS resources
+variable "deploy_rds" {
+  description = "Deploy RDS resources? Set to true for production, false for local testing."
+  type        = bool
+  default     = false
+}
+
+# New variable to control S3 website configuration for local testing
+variable "use_website_configuration" {
+  description = "Enable website configuration for S3 bucket. Set to true for production, false for local testing."
+  type        = bool
+  default     = false
+}
+
+
+
+
+============================================
+File: ./inboxflow-scripts/README.md
+Directory: ./inboxflow-scripts
+============================================
+# InboxFlow Scripts
+
+## Overview
+This folder contains various scripts for testing, syncing emails, and deployment automation.
+
+### 1. Run All Tests
+```bash
+./test_runner.sh
+```
+
+### 2. Manually Sync Emails
+```bash
+./sync_emails.sh
+```
+
+### 3. Deploy the System (Future)
+```bash
+./deploy.sh
+```
+
+
+
+============================================
+File: ./inboxflow-scripts/deploy.sh
+Directory: ./inboxflow-scripts
+============================================
+#!/bin/bash
+echo "This is a placeholder for deployment automation."
+
+
+
+============================================
+File: ./inboxflow-scripts/sync_emails.sh
+Directory: ./inboxflow-scripts
+============================================
+#!/bin/bash
+echo "Triggering manual email sync..."
+curl -X POST http://localhost:8000/sync-emails
+
+
+
+============================================
+File: ./inboxflow-scripts/test_runner.sh
+Directory: ./inboxflow-scripts
+============================================
+#!/bin/bash
+echo "Running all tests..."
+pytest inboxflow_dispatcher/tests/
+pytest inboxflow-imap-sync/tests/
+pytest inboxflow-api/tests/
+pytest inboxflow-flows/tests/
+cd inboxflow-frontend && npm test
+
+
+
+============================================
+File: ./inboxflow_dispatcher/Dockerfile
+Directory: ./inboxflow_dispatcher
+============================================
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+COPY . .
+RUN apt-get update && apt-get install -y libpq-dev && \
+    pip install --no-cache-dir --upgrade pip setuptools && \
+    pip install --no-cache-dir -r requirements.txt
+CMD ["python", "dispatcher.py"]
+
+
+
+============================================
+File: ./inboxflow_dispatcher/README.md
+Directory: ./inboxflow_dispatcher
+============================================
+# InboxFlow Dispatcher Service
+
+## Overview
+This service processes emails that have been stored in PostgreSQL and categorizes them based on user-defined flows.
+
+## Setup
+
+### 1. Build the Docker Image
+```bash
+docker build -t inboxflow_dispatcher .
+```
+
+### 2. Run the Dispatcher Service
+```bash
+docker run --rm --name inboxflow_dispatcher --network inboxflow-network --env-file .env inboxflow_dispatcher
+```
+
+### 3. Check Logs
+```bash
+docker logs inboxflow_dispatcher --follow
+```
+
+
+
+============================================
+File: ./inboxflow_dispatcher/config.py
+Directory: ./inboxflow_dispatcher
+============================================
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_URL = os.getenv("DB_URL")
+EMAIL_SERVER = os.getenv("EMAIL_SERVER")
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+REACT_APP_API_URL = os.getenv("REACT_APP_API_URL")
+
+
+
+============================================
+File: ./inboxflow_dispatcher/dispatcher.py
+Directory: ./inboxflow_dispatcher
+============================================
+import logging
+import psycopg2
+import time
+from config import DB_URL
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+def fetch_unprocessed_emails():
+    """Fetches emails from PostgreSQL instead of IMAP."""
+    conn = psycopg2.connect(DB_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, subject FROM emails WHERE status = 'pending'")
+    emails = cursor.fetchall()
+    conn.close()
+    return emails
+
+def process_emails():
+    """Processes emails using database instead of IMAP."""
+    emails = fetch_unprocessed_emails()
+    for email in emails:
+        logger.info(f"Processing email: {email[1]}")
+        # Placeholder for classification or flow logic
+        mark_as_processed(email[0])
+
+def mark_as_processed(email_id):
+    """Marks email as processed in DB."""
+    conn = psycopg2.connect(DB_URL)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE emails SET status = 'processed' WHERE id = %s", (email_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Marked email {email_id} as processed.")
+
+if __name__ == "__main__":
+    logger.info("ðŸ“¬ Dispatcher Service Started")
+    while True:
+        process_emails()
+        logger.info("ðŸ”„ Waiting 10 seconds before checking for new emails...")
+        time.sleep(10)  # Adjust polling interval as needed
+
+
+============================================
+File: ./inboxflow_dispatcher/requirements.txt
+Directory: ./inboxflow_dispatcher
+============================================
+
+psycopg2-binary
+python-dotenv
+
+
+============================================
+File: ./inboxflow_dispatcher/tests/__pycache__/test_inboxflow-dispatcher.cpython-312-pytest-8.3.4.pyc
+Directory: ./inboxflow_dispatcher/tests/__pycache__
+============================================
+Ë
+    Lï¹gÅ   ã                   ó8   — d dl Zd dlmc mZ d dlZd dlmZ d„ Z	y)é    N)Úfetch_unprocessed_emailsc                  óX  — t        «       } t        | t        «      }|sddt        j                  «       v st        j                  t        «      rt        j                  t        «      nddt        j                  «       v st        j                  | «      rt        j                  | «      nddt        j                  «       v st        j                  t        «      rt        j                  t        «      ndt        j                  |«      dœz  }t        t        j                  |«      «      ‚d }y )Nz5assert %(py4)s
+{%(py4)s = %(py0)s(%(py1)s, %(py2)s)
+}Ú
+isinstanceÚemailsÚlist)Úpy0Úpy1Úpy2Úpy4)
+r   r   r   Ú@py_builtinsÚlocalsÚ
+@pytest_arÚ_should_repr_global_nameÚ	_safereprÚAssertionErrorÚ_format_explanation)r   Ú@py_assert3Ú@py_format5s      ú\/Users/stevenmcconnon/Code/InboxFlow/inboxflow-dispatcher/tests/test_inboxflow-dispatcher.pyÚtest_fetch_unprocessed_emailsr      s’   € Ü%Ó'€FÜfœdÓ#Ð#Ò#×#×#×#×#Õ#Œ:×#×#Ó#Œ:×#×#×#×#×#Ò#f×#×#Ó#f×#×#×#×#×#Ò#œd×#×#Ó#œd×#×#Ô#Ð#×#×#×#×#×#Ñ#ó    )
+Úbuiltinsr   Ú_pytest.assertion.rewriteÚ	assertionÚrewriter   ÚpytestÚinboxflow_dispatcher.dispatcherr   r   © r   r   ú<module>r      s   ðß  „ ƒÝ Dó$r   
+
+
+============================================
+File: ./inboxflow_dispatcher/tests/test_inboxflow-dispatcher.py
+Directory: ./inboxflow_dispatcher/tests
+============================================
+import pytest
+from inboxflow_dispatcher.dispatcher import fetch_unprocessed_emails
+
+def test_fetch_unprocessed_emails():
+    emails = fetch_unprocessed_emails()
+    assert isinstance(emails, list)
+
+
+
+============================================
+File: ./local-env.sh
+Directory: .
+============================================
+#!/bin/bash
+# local-env.sh: Automatically load environment variables from .env
+
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
+  echo "Local environment variables loaded from .env"
+else
+  echo ".env file not found!"
+fi
+
+
+============================================
+File: ./out.json
+Directory: .
+============================================
+{"errorMessage": "[Errno 111] Connection refused", "errorType": "ConnectionRefusedError", "requestId": "bbf73907-3b12-489c-b250-69f059aa4b1e", "stackTrace": ["  File \"/var/task/imap_sync.py\", line 169, in lambda_handler\n    server_uids, emails = fetch_emails(start_index)\n", "  File \"/var/task/imap_sync.py\", line 91, in fetch_emails\n    conn = connect_imap()\n", "  File \"/var/task/imap_sync.py\", line 25, in connect_imap\n    conn = imaplib.IMAP4_SSL(EMAIL_SERVER)\n", "  File \"/var/lang/lib/python3.9/imaplib.py\", line 1324, in __init__\n    IMAP4.__init__(self, host, port, timeout)\n", "  File \"/var/lang/lib/python3.9/imaplib.py\", line 202, in __init__\n    self.open(host, port, timeout)\n", "  File \"/var/lang/lib/python3.9/imaplib.py\", line 1337, in open\n    IMAP4.open(self, host, port, timeout)\n", "  File \"/var/lang/lib/python3.9/imaplib.py\", line 312, in open\n    self.sock = self._create_socket(timeout)\n", "  File \"/var/lang/lib/python3.9/imaplib.py\", line 1327, in _create_socket\n    sock = IMAP4._create_socket(self, timeout)\n", "  File \"/var/lang/lib/python3.9/imaplib.py\", line 302, in _create_socket\n    return socket.create_connection(address)\n", "  File \"/var/lang/lib/python3.9/socket.py\", line 856, in create_connection\n    raise err\n", "  File \"/var/lang/lib/python3.9/socket.py\", line 844, in create_connection\n    sock.connect(sa)\n"]}
+
+
+============================================
+File: ./package_lambda.sh
+Directory: .
+============================================
+#!/bin/bash
+set -e
+
+OUTPUT_ZIP="inboxflow-infrastructure/lambda_package.zip"
+
+echo "Packaging Lambda function in an Amazon Linux environment..."
+
+# Create a package directory inside the inboxflow-imap-sync folder
+mkdir -p inboxflow-imap-sync/package
+
+# Use the AWS SAM build image for Python 3.9 to install dependencies into the package directory
+docker run --rm --platform linux/amd64 -v "$PWD":/var/task public.ecr.aws/sam/build-python3.9 \
+  pip install --no-cache-dir --only-binary=:all: --target /var/task/inboxflow-imap-sync/package -r inboxflow-imap-sync/requirements.txt
+
+# Copy your Lambda code into the package directory
+cp -r inboxflow-imap-sync/*.py inboxflow-imap-sync/package/
+
+# Change directory to the package folder and create the zip file
+cd inboxflow-imap-sync/package
+zip -r9 ../../${OUTPUT_ZIP} .
+cd ../../
+
+# Clean up the package directory
+rm -rf inboxflow-imap-sync/package
+
+echo "Lambda package created: $(pwd)/${OUTPUT_ZIP}"
+
+
+============================================
+File: ./template.json
+Directory: .
+============================================
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Transform": "AWS::Serverless-2016-10-31",
+    "Description": "InboxFlow IMAP Sync Lambda Function",
+    "Resources": {
+      "ImapSyncFunction": {
+        "Type": "AWS::Serverless::Function",
+        "Properties": {
+          "CodeUri": "inboxflow-imap-sync/",
+          "Handler": "imap_sync.lambda_handler",
+          "Runtime": "python3.9",
+          "Timeout": 900,
+          "Environment": {
+            "Variables": {
+              "DB_URL": "postgresql://user:pass@localhost:5432/inboxflow",
+              "EMAIL_SERVER": "imap.mail.yahoo.com",
+              "EMAIL_USER": "you@example.com",
+              "EMAIL_PASSWORD": "REDACTED_APP_PASSWORD"
+            }
+          }
+        }
+      }
+    }
+  }
+
+

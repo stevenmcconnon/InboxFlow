@@ -1,32 +1,28 @@
 import os
 import logging
 import asyncpg
-import sys
+import asyncio
 from imapclient import IMAPClient
 from email.parser import BytesParser
 from datetime import datetime
 from dotenv import load_dotenv
-import asyncio
 
 # Load environment variables from .env
 load_dotenv()
 
 # Environment configuration
 EMAIL_SERVER = os.getenv("EMAIL_SERVER", "imap.mail.yahoo.com")
-EMAIL_USER = os.getenv("EMAIL_USER", "you@example.com")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "REDACTED_APP_PASSWORD")
+EMAIL_USER = os.getenv("EMAIL_USER", "your_email@yahoo.com")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "your_app_password")
 DB_URL = os.getenv("DB_URL")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))  # Configurable batch size
 
-# Configure logging: flush logs to STDOUT immediately
+# Configure logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
-logger.propagate = False
 
 logger.info("Environment loaded. (Sensitive values are not logged.)")
 
@@ -76,21 +72,24 @@ def get_folders(client):
         return []
 
 ####################################
-# Fetch email UIDs
+# Fetch email UIDs (Paginated)
 ####################################
-def search_emails(client, folder, last_sync):
+def search_emails(client, folder):
     try:
         client.select_folder(folder)
         uids = client.search(["ALL"])
-        last_100 = sorted(uids)[-BATCH_SIZE:]  # Get the latest 100 emails
-        logger.info(f"📩 Folder '{folder}': Found {len(last_100)} UIDs.")
-        return last_100
+        uids = sorted(uids)
+
+        # Split into batches of 100
+        batches = [uids[i:i+BATCH_SIZE] for i in range(0, len(uids), BATCH_SIZE)]
+        logger.info(f"📩 Folder '{folder}': Found {len(uids)} UIDs, divided into {len(batches)} batches.")
+        return batches
     except Exception as e:
         logger.error(f"Error searching emails in folder '{folder}': {e}")
         return []
 
 ####################################
-# Fetch email headers
+# Fetch email headers (Batch Processing)
 ####################################
 def fetch_headers_batch(client, folder, uid_batch):
     try:
@@ -101,7 +100,7 @@ def fetch_headers_batch(client, folder, uid_batch):
         for uid, data in headers.items():
             raw_header = data[b'RFC822.HEADER']
             header_text = raw_header.decode(errors="ignore")
-            header_map[uid] = header_text
+            header_map[str(uid)] = header_text  # Store UIDs as strings
 
         logger.info(f"✅ Retrieved headers for {len(header_map)} emails in folder '{folder}'.")
         return header_map
@@ -124,59 +123,50 @@ def parse_header(header):
     return subject, sender, has_attachment
 
 ####################################
-# Store email metadata in the database
+# Store email metadata in bulk
 ####################################
-async def store_email_header(db_pool, uid, header, folder):
-    try:
-        subject, sender, has_attachment = parse_header(header)
-        last_synced = datetime.utcnow()
-
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO emails (id, subject, sender, last_synced, folder, has_attachment, status)
-                VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-                ON CONFLICT (id) DO UPDATE 
-                    SET subject = EXCLUDED.subject,
-                        sender = EXCLUDED.sender,
-                        last_synced = EXCLUDED.last_synced,
-                        folder = EXCLUDED.folder,
-                        has_attachment = EXCLUDED.has_attachment
-                """,
-                str(uid), subject, sender, last_synced, folder, has_attachment
-            )
-
-        logger.info(f"✅ Stored email UID {uid} in folder '{folder}'.")
-    except Exception as e:
-        logger.error(f"Error storing email UID {uid}: {e}")
+async def store_email_headers(db_pool, headers, folder):
+    if not headers:
+        return
+    
+    query = """
+    INSERT INTO emails (id, subject, sender, last_synced, folder, has_attachment, status)
+    VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+    ON CONFLICT (id) DO UPDATE 
+        SET subject = EXCLUDED.subject,
+            sender = EXCLUDED.sender,
+            last_synced = EXCLUDED.last_synced,
+            folder = EXCLUDED.folder,
+            has_attachment = EXCLUDED.has_attachment
+    """
+    async with db_pool.acquire() as conn:
+        await conn.executemany(query, headers)
+    
+    logger.info(f"✅ Stored {len(headers)} email headers in folder '{folder}'.")
 
 ####################################
-# Process a single folder
+# Process a single folder (Parallel Processing)
 ####################################
 async def process_folder(client, folder, db_pool):
     logger.info(f"📂 Processing folder '{folder}'")
 
-    last_sync = await get_folder_last_sync(db_pool, folder)
-    uids = search_emails(client, folder, last_sync)
-
-    if not uids:
-        logger.warning(f"⚠️ No new emails found in '{folder}', skipping.")
-        return
-
-    batches = [uids[i:i+BATCH_SIZE] for i in range(0, len(uids), BATCH_SIZE)]
-
-    for batch in batches:
+    uid_batches = search_emails(client, folder)
+    
+    for batch in uid_batches:
         headers = fetch_headers_batch(client, folder, batch)
-        if not headers:
-            continue
-
-        for uid, header in headers.items():
-            await store_email_header(db_pool, uid, header, folder)
+        
+        # Convert headers into database-ready tuples
+        header_data = [
+            (uid, *parse_header(header), datetime.utcnow(), folder)
+            for uid, header in headers.items()
+        ]
+        
+        await store_email_headers(db_pool, header_data, folder)
 
     await update_folder_last_sync(db_pool, folder, datetime.utcnow())
 
 ####################################
-# Process all folders
+# Process all folders in parallel
 ####################################
 async def process_all_folders(db_pool):
     client = connect_imap()
@@ -184,8 +174,9 @@ async def process_all_folders(db_pool):
         return
 
     folders = get_folders(client)
-    for folder in folders:
-        await process_folder(client, folder, db_pool)
+
+    # Process all folders in parallel
+    await asyncio.gather(*(process_folder(client, folder, db_pool) for folder in folders))
 
     client.logout()
 
